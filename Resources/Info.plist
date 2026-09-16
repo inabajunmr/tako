@@ -20,5 +20,7 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSScreenCaptureUsageDescription</key>
+	<string>TakoLauncher uses window titles to let you choose a specific app window.</string>
 </dict>
 </plist>

@@ -1,15 +1,40 @@
 import AppKit
+import ApplicationServices
 import Carbon
+import ScreenCaptureKit
+import UniformTypeIdentifiers
+
+enum LaunchTargetKind: Hashable {
+    case application
+    case window
+}
 
 struct LaunchableApp: Hashable {
     let name: String
-    let url: URL
+    let applicationName: String?
+    let url: URL?
     let bundleIdentifier: String?
     let searchText: String
+    let identityKey: String
     let historyKey: String
+    let processIdentifier: pid_t?
+    let isRunning: Bool
+    let targetKind: LaunchTargetKind
+    let windowTitle: String?
 
     var subtitle: String {
-        bundleIdentifier ?? url.path
+        switch targetKind {
+        case .application:
+            let detail = bundleIdentifier ?? url?.path ?? processIdentifier.map { "pid \($0)" } ?? "Unknown source"
+            return isRunning ? "Running - \(detail)" : detail
+        case .window:
+            let owner = applicationName ?? bundleIdentifier ?? processIdentifier.map { "pid \($0)" } ?? "Unknown app"
+            return "Window - \(owner)"
+        }
+    }
+
+    var resolvedPath: String? {
+        url?.resolvingSymlinksInPath().path
     }
 
     func matches(_ query: String) -> Bool {
@@ -28,10 +53,29 @@ struct LaunchableApp: Hashable {
             ) != nil
         }
     }
+
+    func markedRunning(processIdentifier: pid_t?) -> LaunchableApp {
+        let runningSearchText = [searchText, "running"]
+            .joined(separator: " ")
+
+        return LaunchableApp(
+            name: name,
+            applicationName: applicationName,
+            url: url,
+            bundleIdentifier: bundleIdentifier,
+            searchText: runningSearchText,
+            identityKey: identityKey,
+            historyKey: historyKey,
+            processIdentifier: processIdentifier,
+            isRunning: true,
+            targetKind: targetKind,
+            windowTitle: windowTitle
+        )
+    }
 }
 
 enum AppDiscovery {
-    static func loadApplications() -> [LaunchableApp] {
+    static func loadInstalledApplications() -> [LaunchableApp] {
         let fileManager = FileManager.default
         let roots = [
             URL(fileURLWithPath: "/Applications", isDirectory: true),
@@ -49,6 +93,82 @@ enum AppDiscovery {
         return apps.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
+    }
+
+    static func includeRunningApplications(in installedApps: [LaunchableApp]) -> [LaunchableApp] {
+        var appsByHistoryKey: [String: LaunchableApp] = [:]
+        var historyKeyByPath: [String: String] = [:]
+
+        func store(_ app: LaunchableApp) {
+            appsByHistoryKey[app.historyKey] = app
+
+            if let resolvedPath = app.resolvedPath {
+                historyKeyByPath[resolvedPath] = app.historyKey
+            }
+        }
+
+        for app in installedApps {
+            store(app)
+        }
+
+        for runningApp in runningApplications() {
+            let existingKey = runningApp.resolvedPath.flatMap { historyKeyByPath[$0] } ?? runningApp.historyKey
+
+            if let existingApp = appsByHistoryKey[existingKey] {
+                store(existingApp.markedRunning(processIdentifier: runningApp.processIdentifier))
+            } else {
+                store(runningApp)
+            }
+        }
+
+        var candidatesByIdentityKey = Dictionary(
+            uniqueKeysWithValues: appsByHistoryKey.values.map { ($0.identityKey, $0) }
+        )
+
+        for windowCandidate in windowCandidates(for: Array(appsByHistoryKey.values)) {
+            candidatesByIdentityKey[windowCandidate.identityKey] = windowCandidate
+        }
+
+        return candidatesByIdentityKey.values.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    static func statusReport(candidates: [LaunchableApp]) -> String {
+        let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
+        let workspaceRunningApps = NSWorkspace.shared.runningApplications.filter {
+            $0.processIdentifier != currentProcessIdentifier
+        }
+        let regularRunningApps = workspaceRunningApps.filter {
+            $0.activationPolicy == .regular
+        }
+        let coreGraphicsWindowOwnerApps = coreGraphicsRunningApplications()
+        let discoverableRunningApps = runningApplications()
+        let runningCandidates = candidates.filter {
+            $0.isRunning && $0.targetKind == .application
+        }
+        let windowCandidates = candidates.filter {
+            $0.targetKind == .window
+        }
+        let runningNames = runningCandidates
+            .map(\.name)
+            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+            .prefix(12)
+            .joined(separator: ", ")
+        let namesLine = runningNames.isEmpty
+            ? "Running candidate names: none"
+            : "Running candidate names: \(runningNames)"
+
+        return """
+        Launcher candidates: \(candidates.count)
+        NSWorkspace running apps: \(workspaceRunningApps.count)
+        NSWorkspace regular running apps: \(regularRunningApps.count)
+        CoreGraphics window owner apps: \(coreGraphicsWindowOwnerApps.count)
+        Discoverable running apps: \(discoverableRunningApps.count)
+        Running app candidates: \(runningCandidates.count)
+        Window candidates: \(windowCandidates.count)
+        \(namesLine)
+        """
     }
 
     private static func applications(in root: URL, seenPaths: inout Set<String>) -> [LaunchableApp] {
@@ -105,11 +225,374 @@ enum AppDiscovery {
 
         return LaunchableApp(
             name: displayName,
+            applicationName: displayName,
             url: url,
             bundleIdentifier: bundleIdentifier,
             searchText: searchText,
-            historyKey: historyKey
+            identityKey: historyKey,
+            historyKey: historyKey,
+            processIdentifier: nil,
+            isRunning: false,
+            targetKind: .application,
+            windowTitle: nil
         )
+    }
+
+    private static func runningApplications() -> [LaunchableApp] {
+        var appsByProcessIdentifier: [pid_t: LaunchableApp] = [:]
+        let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
+
+        for runningApplication in NSWorkspace.shared.runningApplications {
+            guard runningApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+                continue
+            }
+
+            guard runningApplication.activationPolicy == .regular else {
+                continue
+            }
+
+            if let app = makeApp(from: runningApplication) {
+                appsByProcessIdentifier[runningApplication.processIdentifier] = app
+            }
+        }
+
+        for app in coreGraphicsRunningApplications() {
+            guard let processIdentifier = app.processIdentifier else {
+                continue
+            }
+
+            guard processIdentifier != currentProcessIdentifier else {
+                continue
+            }
+
+            appsByProcessIdentifier[processIdentifier] = appsByProcessIdentifier[processIdentifier] ?? app
+        }
+
+        return appsByProcessIdentifier.values.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private static func makeApp(
+        from runningApplication: NSRunningApplication,
+        fallbackName: String? = nil
+    ) -> LaunchableApp? {
+        let url = runningApplication.bundleURL
+        let bundle = url.flatMap { Bundle(url: $0) }
+        let localizedInfo = bundle?.localizedInfoDictionary
+        let info = bundle?.infoDictionary
+
+        let displayNameCandidates: [String?] = [
+            runningApplication.localizedName,
+            localizedInfo?["CFBundleDisplayName"] as? String,
+            localizedInfo?["CFBundleName"] as? String,
+            info?["CFBundleDisplayName"] as? String,
+            info?["CFBundleName"] as? String,
+            fallbackName,
+            url.flatMap { resourceName(for: $0) },
+            url?.deletingPathExtension().lastPathComponent
+        ]
+        let displayName = displayNameCandidates
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty }
+
+        guard let displayName else {
+            return nil
+        }
+
+        let bundleIdentifier = runningApplication.bundleIdentifier ?? bundle?.bundleIdentifier
+        let resolvedPath = url?.resolvingSymlinksInPath().path
+        let historyKey = bundleIdentifier.map { "bundle:\($0)" } ??
+            resolvedPath.map { "path:\($0)" } ??
+            "pid:\(runningApplication.processIdentifier)"
+        let searchText = [
+            displayName,
+            bundleIdentifier,
+            url?.lastPathComponent,
+            url?.path,
+            "running"
+        ]
+            .compactMap { $0 }
+            .joined(separator: " ")
+
+        return LaunchableApp(
+            name: displayName,
+            applicationName: displayName,
+            url: url,
+            bundleIdentifier: bundleIdentifier,
+            searchText: searchText,
+            identityKey: historyKey,
+            historyKey: historyKey,
+            processIdentifier: runningApplication.processIdentifier,
+            isRunning: true,
+            targetKind: .application,
+            windowTitle: nil
+        )
+    }
+
+    private static func makeRunningApp(
+        name: String,
+        processIdentifier: pid_t,
+        url: URL?,
+        bundleIdentifier: String?
+    ) -> LaunchableApp {
+        let resolvedPath = url?.resolvingSymlinksInPath().path
+        let historyKey = bundleIdentifier.map { "bundle:\($0)" } ??
+            resolvedPath.map { "path:\($0)" } ??
+            "pid:\(processIdentifier)"
+        let searchText = [
+            name,
+            bundleIdentifier,
+            url?.lastPathComponent,
+            url?.path,
+            "running"
+        ]
+            .compactMap { $0 }
+            .joined(separator: " ")
+
+        return LaunchableApp(
+            name: name,
+            applicationName: name,
+            url: url,
+            bundleIdentifier: bundleIdentifier,
+            searchText: searchText,
+            identityKey: historyKey,
+            historyKey: historyKey,
+            processIdentifier: processIdentifier,
+            isRunning: true,
+            targetKind: .application,
+            windowTitle: nil
+        )
+    }
+
+    private static func coreGraphicsRunningApplications() -> [LaunchableApp] {
+        guard
+            let windowInfoList = CGWindowListCopyWindowInfo(
+                [.optionAll, .excludeDesktopElements],
+                kCGNullWindowID
+            ) as? [[String: Any]]
+        else {
+            return []
+        }
+
+        var appsByProcessIdentifier: [pid_t: LaunchableApp] = [:]
+        let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
+
+        for info in windowInfoList {
+            guard
+                let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                layer == 0,
+                let processIdentifier = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                processIdentifier != currentProcessIdentifier,
+                appsByProcessIdentifier[processIdentifier] == nil
+            else {
+                continue
+            }
+
+            if let bounds = info[kCGWindowBounds as String] as? [String: Any] {
+                let width = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
+                let height = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
+
+                guard width >= 80, height >= 40 else {
+                    continue
+                }
+            }
+
+            let ownerName = (info[kCGWindowOwnerName as String] as? String)?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let runningApplication = NSRunningApplication(processIdentifier: processIdentifier)
+
+            if let runningApplication, let app = makeApp(from: runningApplication, fallbackName: ownerName) {
+                appsByProcessIdentifier[processIdentifier] = app
+                continue
+            }
+
+            guard let ownerName, !ownerName.isEmpty else {
+                continue
+            }
+
+            appsByProcessIdentifier[processIdentifier] = makeRunningApp(
+                name: ownerName,
+                processIdentifier: processIdentifier,
+                url: runningApplication?.bundleURL,
+                bundleIdentifier: runningApplication?.bundleIdentifier
+            )
+        }
+
+        return appsByProcessIdentifier.values.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private static func windowCandidates(for apps: [LaunchableApp]) -> [LaunchableApp] {
+        var candidates: [LaunchableApp] = []
+        var seenWindowKeys = Set<String>()
+
+        func append(_ candidate: LaunchableApp) {
+            guard let processIdentifier = candidate.processIdentifier else {
+                return
+            }
+
+            let title = candidate.windowTitle ?? candidate.name
+            let windowKey = "\(processIdentifier):\(title)"
+
+            guard !seenWindowKeys.contains(windowKey) else {
+                return
+            }
+
+            seenWindowKeys.insert(windowKey)
+            candidates.append(candidate)
+        }
+
+        accessibilityWindowCandidates(for: apps).forEach(append)
+        coreGraphicsWindowCandidates(for: apps).forEach(append)
+
+        return candidates
+    }
+
+    private static func accessibilityWindowCandidates(for apps: [LaunchableApp]) -> [LaunchableApp] {
+        guard AXIsProcessTrusted() else {
+            return []
+        }
+
+        return apps.flatMap { app in
+            guard let processIdentifier = app.processIdentifier else {
+                return [LaunchableApp]()
+            }
+
+            let applicationElement = AXUIElementCreateApplication(processIdentifier)
+            let windows = accessibilityWindows(in: applicationElement)
+
+            return windows.enumerated().compactMap { index, window in
+                guard let title = accessibilityTitle(of: window), !title.isEmpty else {
+                    return nil
+                }
+
+                return makeWindowCandidate(
+                    baseApp: app,
+                    title: title,
+                    identityKey: "window:\(processIdentifier):ax:\(index):\(title)"
+                )
+            }
+        }
+    }
+
+    private static func coreGraphicsWindowCandidates(for apps: [LaunchableApp]) -> [LaunchableApp] {
+        let appsByPID = Dictionary(
+            uniqueKeysWithValues: apps.compactMap { app -> (pid_t, LaunchableApp)? in
+                guard let processIdentifier = app.processIdentifier else {
+                    return nil
+                }
+
+                return (processIdentifier, app)
+            }
+        )
+
+        guard
+            let windowInfoList = CGWindowListCopyWindowInfo(
+                [.optionAll, .excludeDesktopElements],
+                kCGNullWindowID
+            ) as? [[String: Any]]
+        else {
+            return []
+        }
+
+        return windowInfoList.compactMap { info in
+            guard
+                let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                layer == 0,
+                let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
+                let baseApp = appsByPID[pid],
+                let windowIdentifier = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
+                let rawTitle = info[kCGWindowName as String] as? String
+            else {
+                return nil
+            }
+
+            let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !title.isEmpty else {
+                return nil
+            }
+
+            if let bounds = info[kCGWindowBounds as String] as? [String: Any] {
+                let width = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
+                let height = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
+
+                guard width >= 80, height >= 40 else {
+                    return nil
+                }
+            }
+
+            let identityKey = "window:\(pid):\(windowIdentifier)"
+            return makeWindowCandidate(
+                baseApp: baseApp,
+                title: title,
+                identityKey: identityKey
+            )
+        }
+    }
+
+    private static func makeWindowCandidate(
+        baseApp: LaunchableApp,
+        title: String,
+        identityKey: String
+    ) -> LaunchableApp {
+        let searchText = [
+            title,
+            baseApp.name,
+            baseApp.applicationName,
+            baseApp.bundleIdentifier,
+            baseApp.url?.lastPathComponent,
+            baseApp.url?.path,
+            "window",
+            "running"
+        ]
+            .compactMap { $0 }
+            .joined(separator: " ")
+
+        return LaunchableApp(
+            name: title,
+            applicationName: baseApp.applicationName ?? baseApp.name,
+            url: baseApp.url,
+            bundleIdentifier: baseApp.bundleIdentifier,
+            searchText: searchText,
+            identityKey: identityKey,
+            historyKey: baseApp.historyKey,
+            processIdentifier: baseApp.processIdentifier,
+            isRunning: true,
+            targetKind: .window,
+            windowTitle: title
+        )
+    }
+
+    private static func accessibilityWindows(in applicationElement: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            applicationElement,
+            kAXWindowsAttribute as CFString,
+            &value
+        )
+
+        guard error == .success, let windows = value as? [AXUIElement] else {
+            return []
+        }
+
+        return windows
+    }
+
+    private static func accessibilityTitle(of window: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            window,
+            kAXTitleAttribute as CFString,
+            &value
+        )
+
+        guard error == .success else {
+            return nil
+        }
+
+        return (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func resourceName(for url: URL) -> String? {
@@ -202,6 +685,335 @@ final class LaunchHistoryStore {
             try data.write(to: fileURL, options: .atomic)
         } catch {
             fputs("Failed to save launch history: \(error.localizedDescription)\n", stderr)
+        }
+    }
+}
+
+enum WindowActivator {
+    static func activateWindow(for app: LaunchableApp) -> Bool {
+        guard
+            app.targetKind == .window,
+            let processIdentifier = app.processIdentifier,
+            let runningApplication = NSRunningApplication(processIdentifier: processIdentifier)
+        else {
+            return false
+        }
+
+        runningApplication.unhide()
+
+        guard AXIsProcessTrusted() else {
+            WindowPermissionManager.requestAccessibilityPermission()
+            _ = runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            return false
+        }
+
+        let applicationElement = AXUIElementCreateApplication(processIdentifier)
+
+        guard let targetWindow = findWindow(in: applicationElement, matching: app.windowTitle) else {
+            _ = runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            return false
+        }
+
+        AXUIElementSetAttributeValue(
+            targetWindow,
+            kAXMinimizedAttribute as CFString,
+            kCFBooleanFalse
+        )
+
+        _ = runningApplication.activate(options: [.activateIgnoringOtherApps])
+        AXUIElementSetAttributeValue(
+            applicationElement,
+            kAXFocusedWindowAttribute as CFString,
+            targetWindow
+        )
+        AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+
+        return true
+    }
+
+    private static func findWindow(in applicationElement: AXUIElement, matching targetTitle: String?) -> AXUIElement? {
+        let windows = windows(in: applicationElement)
+
+        guard let targetTitle else {
+            return windows.first
+        }
+
+        if let exactMatch = windows.first(where: { title(of: $0) == targetTitle }) {
+            return exactMatch
+        }
+
+        return windows.first { window in
+            guard let windowTitle = title(of: window) else {
+                return false
+            }
+
+            return windowTitle.localizedCaseInsensitiveContains(targetTitle) ||
+                targetTitle.localizedCaseInsensitiveContains(windowTitle)
+        }
+    }
+
+    private static func windows(in applicationElement: AXUIElement) -> [AXUIElement] {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            applicationElement,
+            kAXWindowsAttribute as CFString,
+            &value
+        )
+
+        guard error == .success, let windows = value as? [AXUIElement] else {
+            return []
+        }
+
+        return windows
+    }
+
+    private static func title(of window: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            window,
+            kAXTitleAttribute as CFString,
+            &value
+        )
+
+        guard error == .success else {
+            return nil
+        }
+
+        return (value as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+}
+
+enum WindowPermissionManager {
+    private static var isStartupPermissionSequenceRunning = false
+    private static var permissionPollTimer: Timer?
+    private static var lastScreenRecordingRequestStatus: String?
+
+    static func requestStartupPermissions() {
+        guard !isStartupPermissionSequenceRunning else {
+            return
+        }
+
+        guard !isScreenRecordingGranted || !isAccessibilityGranted else {
+            return
+        }
+
+        isStartupPermissionSequenceRunning = true
+        requestScreenRecordingPermission {
+            requestAccessibilityPermission {
+                isStartupPermissionSequenceRunning = false
+            }
+        }
+    }
+
+    static func requestAccessibilityPermission() {
+        requestAccessibilityPermission(onGranted: nil)
+    }
+
+    static func requestScreenRecordingPermission() {
+        requestScreenRecordingPermission(onGranted: nil)
+    }
+
+    private static func requestAccessibilityPermission(onGranted: (() -> Void)?) {
+        guard !isAccessibilityGranted else {
+            onGranted?()
+            return
+        }
+
+        let options = [
+            kAXTrustedCheckOptionPrompt.takeUnretainedValue() as String: true
+        ] as CFDictionary
+
+        AXIsProcessTrustedWithOptions(options)
+
+        if let onGranted {
+            waitUntil({ isAccessibilityGranted }, then: onGranted)
+        }
+    }
+
+    private static func requestScreenRecordingPermission(onGranted: (() -> Void)?) {
+        guard !isScreenRecordingGranted else {
+            lastScreenRecordingRequestStatus = "already granted"
+            onGranted?()
+            return
+        }
+
+        NSApp.activate(ignoringOtherApps: true)
+
+        Task {
+            do {
+                let content = try await SCShareableContent.excludingDesktopWindows(
+                    false,
+                    onScreenWindowsOnly: false
+                )
+
+                await MainActor.run {
+                    lastScreenRecordingRequestStatus = "success: \(content.windows.count) windows"
+                    onGranted?()
+                }
+            } catch {
+                await MainActor.run {
+                    lastScreenRecordingRequestStatus = "error: \(error.localizedDescription)"
+
+                    if !isScreenRecordingGranted {
+                        openScreenRecordingSettings()
+                    }
+
+                    if let onGranted {
+                        waitUntil({ isScreenRecordingGranted }, then: onGranted)
+                    }
+                }
+            }
+        }
+    }
+
+    private static func waitUntil(_ isGranted: @escaping () -> Bool, then onGranted: @escaping () -> Void) {
+        guard !isGranted() else {
+            onGranted()
+            return
+        }
+
+        permissionPollTimer?.invalidate()
+        permissionPollTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { timer in
+            guard isGranted() else {
+                return
+            }
+
+            timer.invalidate()
+            permissionPollTimer = nil
+            onGranted()
+        }
+    }
+
+    static func statusReport() -> String {
+        let accessibilityStatus = isAccessibilityGranted ? "granted" : "not granted"
+        let screenRecordingStatus = isScreenRecordingGranted ? "granted" : "not granted"
+        let coreGraphicsTitleCount = coreGraphicsWindowTitleCount()
+        let accessibilityTitleCount = isAccessibilityGranted ? accessibilityWindowTitleCount() : nil
+        let bundleIdentifier = Bundle.main.bundleIdentifier ?? "unknown"
+        let bundlePath = Bundle.main.bundleURL.path
+        let executablePath = Bundle.main.executableURL?.path ?? "unknown"
+        let appBundleStatus = Bundle.main.bundleURL.pathExtension == "app" ? "yes" : "no"
+        let startupSequenceStatus = isStartupPermissionSequenceRunning ? "running" : "idle"
+        let screenRequestLine = lastScreenRecordingRequestStatus.map {
+            "Last Screen Recording request: \($0)"
+        } ?? "Last Screen Recording request: not requested in this run"
+
+        let axLine = accessibilityTitleCount.map {
+            "Accessibility window titles visible: \($0)"
+        } ?? "Accessibility window titles visible: unavailable until Accessibility is granted"
+
+        return """
+        Bundle ID: \(bundleIdentifier)
+        App bundle: \(appBundleStatus)
+        Bundle path: \(bundlePath)
+        Executable: \(executablePath)
+
+        Accessibility: \(accessibilityStatus)
+        Screen Recording: \(screenRecordingStatus)
+        Startup permission sequence: \(startupSequenceStatus)
+        \(screenRequestLine)
+        CoreGraphics window titles visible: \(coreGraphicsTitleCount)
+        \(axLine)
+
+        If Screen Recording was just granted, quit and reopen TakoLauncher. macOS often applies that permission only after restart.
+        """
+    }
+
+    static func openAccessibilitySettings() {
+        openSettingsPane("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
+    }
+
+    static func openScreenRecordingSettings() {
+        openSettingsPane("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
+    }
+
+    static func revealAppBundle() {
+        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
+    }
+
+    private static func openSettingsPane(_ urlString: String) {
+        guard let url = URL(string: urlString) else {
+            return
+        }
+
+        NSWorkspace.shared.open(url)
+    }
+
+    private static var isAccessibilityGranted: Bool {
+        AXIsProcessTrusted()
+    }
+
+    private static var isScreenRecordingGranted: Bool {
+        CGPreflightScreenCaptureAccess()
+    }
+
+    private static func coreGraphicsWindowTitleCount() -> Int {
+        guard
+            let windowInfoList = CGWindowListCopyWindowInfo(
+                [.optionAll, .excludeDesktopElements],
+                kCGNullWindowID
+            ) as? [[String: Any]]
+        else {
+            return 0
+        }
+
+        return windowInfoList.reduce(0) { count, info in
+            guard
+                let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                layer == 0,
+                let title = (info[kCGWindowName as String] as? String)?
+                    .trimmingCharacters(in: .whitespacesAndNewlines),
+                !title.isEmpty
+            else {
+                return count
+            }
+
+            return count + 1
+        }
+    }
+
+    private static func accessibilityWindowTitleCount() -> Int {
+        NSWorkspace.shared.runningApplications.reduce(0) { count, runningApplication in
+            guard
+                runningApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                runningApplication.activationPolicy == .regular
+            else {
+                return count
+            }
+
+            let applicationElement = AXUIElementCreateApplication(runningApplication.processIdentifier)
+            var windowsValue: CFTypeRef?
+            let windowsError = AXUIElementCopyAttributeValue(
+                applicationElement,
+                kAXWindowsAttribute as CFString,
+                &windowsValue
+            )
+
+            guard windowsError == .success, let windows = windowsValue as? [AXUIElement] else {
+                return count
+            }
+
+            let titledWindowCount = windows.reduce(0) { partialCount, window in
+                var titleValue: CFTypeRef?
+                let titleError = AXUIElementCopyAttributeValue(
+                    window,
+                    kAXTitleAttribute as CFString,
+                    &titleValue
+                )
+
+                guard
+                    titleError == .success,
+                    let title = (titleValue as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
+                    !title.isEmpty
+                else {
+                    return partialCount
+                }
+
+                return partialCount + 1
+            }
+
+            return count + titledWindowCount
         }
     }
 }
@@ -336,7 +1148,17 @@ final class AppCellView: NSTableCellView {
     }
 
     func configure(with app: LaunchableApp) {
-        appIconView.image = NSWorkspace.shared.icon(forFile: app.url.path)
+        if let url = app.url {
+            appIconView.image = NSWorkspace.shared.icon(forFile: url.path)
+        } else if
+            let processIdentifier = app.processIdentifier,
+            let runningApplication = NSRunningApplication(processIdentifier: processIdentifier),
+            let icon = runningApplication.icon {
+            appIconView.image = icon
+        } else {
+            appIconView.image = NSWorkspace.shared.icon(for: .applicationBundle)
+        }
+
         titleLabel.stringValue = app.name
         detailLabel.stringValue = app.subtitle
     }
@@ -620,6 +1442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
+    private var cachedInstalledApps: [LaunchableApp] = []
     private var cachedApps: [LaunchableApp] = []
     private var lastScanDate = Date.distantPast
 
@@ -629,6 +1452,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         registerHotKey()
         refreshApplications(force: true)
+        WindowPermissionManager.requestStartupPermissions()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -693,6 +1517,36 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             title: "Rescan Applications",
             action: #selector(rescanApplicationsFromMenu),
             keyEquivalent: "r"
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Request Accessibility Permission",
+            action: #selector(requestAccessibilityPermissionFromMenu),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Request Screen Recording Permission",
+            action: #selector(requestScreenRecordingPermissionFromMenu),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Show Window Permission Status",
+            action: #selector(showWindowPermissionStatusFromMenu),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Open Accessibility Settings",
+            action: #selector(openAccessibilitySettingsFromMenu),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Open Screen Recording Settings",
+            action: #selector(openScreenRecordingSettingsFromMenu),
+            keyEquivalent: ""
+        ))
+        menu.addItem(NSMenuItem(
+            title: "Reveal TakoLauncher in Finder",
+            action: #selector(revealTakoLauncherFromMenu),
+            keyEquivalent: ""
         ))
         menu.addItem(.separator())
         menu.addItem(NSMenuItem(
@@ -783,6 +1637,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         showLauncher()
     }
 
+    @objc private func requestAccessibilityPermissionFromMenu() {
+        WindowPermissionManager.requestAccessibilityPermission()
+        refreshApplications(force: true)
+        showLauncher()
+    }
+
+    @objc private func requestScreenRecordingPermissionFromMenu() {
+        WindowPermissionManager.requestScreenRecordingPermission()
+        refreshApplications(force: true)
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+            self?.showWindowPermissionStatusFromMenu()
+        }
+    }
+
+    @objc private func showWindowPermissionStatusFromMenu() {
+        refreshApplications(force: true)
+
+        let alert = NSAlert()
+        alert.messageText = "Window Permission Status"
+        alert.informativeText = [
+            WindowPermissionManager.statusReport(),
+            AppDiscovery.statusReport(candidates: cachedApps)
+        ].joined(separator: "\n\n")
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "OK")
+
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    @objc private func openAccessibilitySettingsFromMenu() {
+        WindowPermissionManager.openAccessibilitySettings()
+    }
+
+    @objc private func openScreenRecordingSettingsFromMenu() {
+        WindowPermissionManager.openScreenRecordingSettings()
+    }
+
+    @objc private func revealTakoLauncherFromMenu() {
+        WindowPermissionManager.revealAppBundle()
+    }
+
     @objc private func quitFromMenu() {
         NSApp.terminate(nil)
     }
@@ -839,21 +1736,44 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func refreshApplications(force: Bool) {
-        guard force || cachedApps.isEmpty || Date().timeIntervalSince(lastScanDate) > 30 else {
-            return
+        if force || cachedInstalledApps.isEmpty || Date().timeIntervalSince(lastScanDate) > 30 {
+            cachedInstalledApps = AppDiscovery.loadInstalledApplications()
+            lastScanDate = Date()
         }
 
-        cachedApps = AppDiscovery.loadApplications()
-        lastScanDate = Date()
+        cachedApps = AppDiscovery.includeRunningApplications(in: cachedInstalledApps)
     }
 
     private func launch(_ app: LaunchableApp) {
         hideLauncher()
 
+        if WindowActivator.activateWindow(for: app) {
+            launchHistoryStore.recordLaunch(of: app)
+            return
+        }
+
+        if
+            app.isRunning,
+            let processIdentifier = app.processIdentifier,
+            let runningApplication = NSRunningApplication(processIdentifier: processIdentifier) {
+            runningApplication.unhide()
+
+            if runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps]) {
+                launchHistoryStore.recordLaunch(of: app)
+                return
+            }
+        }
+
+        guard let url = app.url else {
+            NSSound.beep()
+            fputs("Failed to activate \(app.name): no application URL is available\n", stderr)
+            return
+        }
+
         let configuration = NSWorkspace.OpenConfiguration()
         configuration.activates = true
 
-        NSWorkspace.shared.openApplication(at: app.url, configuration: configuration) { _, error in
+        NSWorkspace.shared.openApplication(at: url, configuration: configuration) { _, error in
             if let error {
                 NSSound.beep()
                 fputs("Failed to launch \(app.name): \(error.localizedDescription)\n", stderr)

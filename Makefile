@@ -3,6 +3,7 @@ BUILD_DIR := .build/release
 APP_DIR := dist/$(APP_NAME).app
 CONTENTS_DIR := $(APP_DIR)/Contents
 MACOS_DIR := $(CONTENTS_DIR)/MacOS
+CODESIGN_IDENTITY ?= -
 
 .PHONY: build run package open
 
@@ -17,6 +18,7 @@ package: build
 	cp "$(BUILD_DIR)/$(APP_NAME)" "$(MACOS_DIR)/$(APP_NAME)"
 	cp Resources/Info.plist "$(CONTENTS_DIR)/Info.plist"
 	chmod +x "$(MACOS_DIR)/$(APP_NAME)"
+	codesign --force --deep --sign "$(CODESIGN_IDENTITY)" "$(APP_DIR)"
 
 open: package
 	open "$(APP_DIR)"

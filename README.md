@@ -29,6 +29,20 @@ open dist/TakoLauncher.app
 - Double-click an app to launch it
 
 Applications are scanned from `/Applications`, `/System/Applications`, and `~/Applications`.
+Currently running regular apps are also included, even when they are outside those folders.
+Windows for running apps are included as separate candidates when macOS exposes a window title.
+Selecting a window focuses that window when Accessibility permission is granted.
+On startup, TakoLauncher checks its own Screen Recording and Accessibility status, then only
+requests the missing permissions.
+If window titles do not appear, use `Tako` -> `Request Accessibility Permission`, then
+`Tako` -> `Request Screen Recording Permission`.
+Use `Tako` -> `Show Window Permission Status` to see what permissions macOS reports and how many
+window titles are currently visible to the app.
+macOS may require Accessibility permission for window focusing and Screen Recording permission for
+other apps' window titles. Screen Recording changes often require restarting TakoLauncher.
+If the status still says `not granted`, make sure the allowed item in System Settings is the same
+app shown by `Bundle path` in the status dialog. Rebuilding a locally signed app can make macOS
+treat it as a new app for privacy permissions.
 
 Matching results are ranked by local launch history: launch count first, then most recent launch,
 then application name. History is stored at:
