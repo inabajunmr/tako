@@ -2,7 +2,6 @@ import AppKit
 import ApplicationServices
 import Carbon
 import ScreenCaptureKit
-import UniformTypeIdentifiers
 
 enum LaunchTargetKind: Hashable {
     case application
@@ -74,6 +73,77 @@ struct LaunchableApp: Hashable {
     }
 }
 
+private struct CoreGraphicsWindowInfo {
+    let identifier: UInt32?
+    let ownerProcessIdentifier: pid_t
+    let ownerName: String?
+    let title: String?
+    let width: Double?
+    let height: Double?
+
+    var hasTitle: Bool {
+        title?.isEmpty == false
+    }
+
+    var isLargeEnoughForCandidate: Bool {
+        guard let width, let height else {
+            return true
+        }
+
+        return width >= 80 && height >= 40
+    }
+}
+
+private enum CoreGraphicsWindowReader {
+    static func layerZeroWindows() -> [CoreGraphicsWindowInfo] {
+        guard
+            let windowInfoList = CGWindowListCopyWindowInfo(
+                [.optionAll, .excludeDesktopElements],
+                kCGNullWindowID
+            ) as? [[String: Any]]
+        else {
+            return []
+        }
+
+        return windowInfoList.compactMap { info in
+            guard
+                let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
+                layer == 0,
+                let ownerProcessIdentifier = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value
+            else {
+                return nil
+            }
+
+            let bounds = info[kCGWindowBounds as String] as? [String: Any]
+            let width = (bounds?["Width"] as? NSNumber)?.doubleValue
+            let height = (bounds?["Height"] as? NSNumber)?.doubleValue
+            let identifier = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+
+            return CoreGraphicsWindowInfo(
+                identifier: identifier,
+                ownerProcessIdentifier: ownerProcessIdentifier,
+                ownerName: trimmedString(info[kCGWindowOwnerName as String]),
+                title: trimmedString(info[kCGWindowName as String]),
+                width: width,
+                height: height
+            )
+        }
+    }
+
+    static func candidateWindows() -> [CoreGraphicsWindowInfo] {
+        layerZeroWindows().filter(\.isLargeEnoughForCandidate)
+    }
+
+    private static func trimmedString(_ value: Any?) -> String? {
+        guard let string = value as? String else {
+            return nil
+        }
+
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 enum AppDiscovery {
     static func loadInstalledApplications() -> [LaunchableApp] {
         let fileManager = FileManager.default
@@ -134,7 +204,7 @@ enum AppDiscovery {
         }
     }
 
-    static func statusReport(candidates: [LaunchableApp]) -> String {
+    static func candidateStatusReport(candidates: [LaunchableApp]) -> String {
         let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
         let workspaceRunningApps = NSWorkspace.shared.runningApplications.filter {
             $0.processIdentifier != currentProcessIdentifier
@@ -142,7 +212,9 @@ enum AppDiscovery {
         let regularRunningApps = workspaceRunningApps.filter {
             $0.activationPolicy == .regular
         }
-        let coreGraphicsWindowOwnerApps = coreGraphicsRunningApplications()
+        let coreGraphicsWindowOwnerCount = Set(
+            CoreGraphicsWindowReader.candidateWindows().map(\.ownerProcessIdentifier)
+        ).count
         let discoverableRunningApps = runningApplications()
         let runningCandidates = candidates.filter {
             $0.isRunning && $0.targetKind == .application
@@ -150,24 +222,14 @@ enum AppDiscovery {
         let windowCandidates = candidates.filter {
             $0.targetKind == .window
         }
-        let runningNames = runningCandidates
-            .map(\.name)
-            .sorted { $0.localizedStandardCompare($1) == .orderedAscending }
-            .prefix(12)
-            .joined(separator: ", ")
-        let namesLine = runningNames.isEmpty
-            ? "Running candidate names: none"
-            : "Running candidate names: \(runningNames)"
-
         return """
         Launcher candidates: \(candidates.count)
         NSWorkspace running apps: \(workspaceRunningApps.count)
         NSWorkspace regular running apps: \(regularRunningApps.count)
-        CoreGraphics window owner apps: \(coreGraphicsWindowOwnerApps.count)
+        CoreGraphics window owner apps: \(coreGraphicsWindowOwnerCount)
         Discoverable running apps: \(discoverableRunningApps.count)
         Running app candidates: \(runningCandidates.count)
         Window candidates: \(windowCandidates.count)
-        \(namesLine)
         """
     }
 
@@ -243,7 +305,7 @@ enum AppDiscovery {
         let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
 
         for runningApplication in NSWorkspace.shared.runningApplications {
-            guard runningApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier else {
+            guard runningApplication.processIdentifier != currentProcessIdentifier else {
                 continue
             }
 
@@ -301,32 +363,11 @@ enum AppDiscovery {
         }
 
         let bundleIdentifier = runningApplication.bundleIdentifier ?? bundle?.bundleIdentifier
-        let resolvedPath = url?.resolvingSymlinksInPath().path
-        let historyKey = bundleIdentifier.map { "bundle:\($0)" } ??
-            resolvedPath.map { "path:\($0)" } ??
-            "pid:\(runningApplication.processIdentifier)"
-        let searchText = [
-            displayName,
-            bundleIdentifier,
-            url?.lastPathComponent,
-            url?.path,
-            "running"
-        ]
-            .compactMap { $0 }
-            .joined(separator: " ")
-
-        return LaunchableApp(
+        return makeRunningApp(
             name: displayName,
-            applicationName: displayName,
-            url: url,
-            bundleIdentifier: bundleIdentifier,
-            searchText: searchText,
-            identityKey: historyKey,
-            historyKey: historyKey,
             processIdentifier: runningApplication.processIdentifier,
-            isRunning: true,
-            targetKind: .application,
-            windowTitle: nil
+            url: url,
+            bundleIdentifier: bundleIdentifier
         )
     }
 
@@ -366,48 +407,26 @@ enum AppDiscovery {
     }
 
     private static func coreGraphicsRunningApplications() -> [LaunchableApp] {
-        guard
-            let windowInfoList = CGWindowListCopyWindowInfo(
-                [.optionAll, .excludeDesktopElements],
-                kCGNullWindowID
-            ) as? [[String: Any]]
-        else {
-            return []
-        }
-
         var appsByProcessIdentifier: [pid_t: LaunchableApp] = [:]
         let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
 
-        for info in windowInfoList {
+        for windowInfo in CoreGraphicsWindowReader.candidateWindows() {
             guard
-                let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
-                layer == 0,
-                let processIdentifier = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
-                processIdentifier != currentProcessIdentifier,
-                appsByProcessIdentifier[processIdentifier] == nil
+                windowInfo.ownerProcessIdentifier != currentProcessIdentifier,
+                appsByProcessIdentifier[windowInfo.ownerProcessIdentifier] == nil
             else {
                 continue
             }
 
-            if let bounds = info[kCGWindowBounds as String] as? [String: Any] {
-                let width = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
-                let height = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
-
-                guard width >= 80, height >= 40 else {
-                    continue
-                }
-            }
-
-            let ownerName = (info[kCGWindowOwnerName as String] as? String)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let processIdentifier = windowInfo.ownerProcessIdentifier
             let runningApplication = NSRunningApplication(processIdentifier: processIdentifier)
 
-            if let runningApplication, let app = makeApp(from: runningApplication, fallbackName: ownerName) {
+            if let runningApplication, let app = makeApp(from: runningApplication, fallbackName: windowInfo.ownerName) {
                 appsByProcessIdentifier[processIdentifier] = app
                 continue
             }
 
-            guard let ownerName, !ownerName.isEmpty else {
+            guard let ownerName = windowInfo.ownerName else {
                 continue
             }
 
@@ -488,42 +507,16 @@ enum AppDiscovery {
             }
         )
 
-        guard
-            let windowInfoList = CGWindowListCopyWindowInfo(
-                [.optionAll, .excludeDesktopElements],
-                kCGNullWindowID
-            ) as? [[String: Any]]
-        else {
-            return []
-        }
-
-        return windowInfoList.compactMap { info in
+        return CoreGraphicsWindowReader.candidateWindows().compactMap { windowInfo in
             guard
-                let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
-                layer == 0,
-                let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value,
-                let baseApp = appsByPID[pid],
-                let windowIdentifier = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value,
-                let rawTitle = info[kCGWindowName as String] as? String
+                let baseApp = appsByPID[windowInfo.ownerProcessIdentifier],
+                let title = windowInfo.title,
+                let identifier = windowInfo.identifier
             else {
                 return nil
             }
 
-            let title = rawTitle.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !title.isEmpty else {
-                return nil
-            }
-
-            if let bounds = info[kCGWindowBounds as String] as? [String: Any] {
-                let width = (bounds["Width"] as? NSNumber)?.doubleValue ?? 0
-                let height = (bounds["Height"] as? NSNumber)?.doubleValue ?? 0
-
-                guard width >= 80, height >= 40 else {
-                    return nil
-                }
-            }
-
-            let identityKey = "window:\(pid):\(windowIdentifier)"
+            let identityKey = "window:\(windowInfo.ownerProcessIdentifier):\(identifier)"
             return makeWindowCandidate(
                 baseApp: baseApp,
                 title: title,
@@ -949,28 +942,7 @@ enum WindowPermissionManager {
     }
 
     private static func coreGraphicsWindowTitleCount() -> Int {
-        guard
-            let windowInfoList = CGWindowListCopyWindowInfo(
-                [.optionAll, .excludeDesktopElements],
-                kCGNullWindowID
-            ) as? [[String: Any]]
-        else {
-            return 0
-        }
-
-        return windowInfoList.reduce(0) { count, info in
-            guard
-                let layer = (info[kCGWindowLayer as String] as? NSNumber)?.intValue,
-                layer == 0,
-                let title = (info[kCGWindowName as String] as? String)?
-                    .trimmingCharacters(in: .whitespacesAndNewlines),
-                !title.isEmpty
-            else {
-                return count
-            }
-
-            return count + 1
-        }
+        CoreGraphicsWindowReader.layerZeroWindows().filter(\.hasTitle).count
     }
 
     private static func accessibilityWindowTitleCount() -> Int {
@@ -1659,7 +1631,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         alert.messageText = "Window Permission Status"
         alert.informativeText = [
             WindowPermissionManager.statusReport(),
-            AppDiscovery.statusReport(candidates: cachedApps)
+            AppDiscovery.candidateStatusReport(candidates: cachedApps)
         ].joined(separator: "\n\n")
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
