@@ -1,4 +1,4 @@
-APP_NAME := TakoLauncher
+APP_NAME := Tendon
 BUILD_DIR := .build/release
 APP_DIR := dist/$(APP_NAME).app
 CONTENTS_DIR := $(APP_DIR)/Contents
@@ -11,7 +11,7 @@ build:
 	swift build -c release
 
 run:
-	swift run TakoLauncher
+	swift run Tendon
 
 package: build
 	mkdir -p "$(MACOS_DIR)"

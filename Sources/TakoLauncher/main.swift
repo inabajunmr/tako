@@ -6,7 +6,7 @@ import ScreenCaptureKit
 
 enum AppLog {
     #if DEBUG
-    private static let queue = DispatchQueue(label: "TakoLauncher.AppLog")
+    private static let queue = DispatchQueue(label: "Tendon.AppLog")
     private static let dateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
@@ -840,6 +840,7 @@ private struct LaunchHistoryEntry: Codable {
 final class LaunchHistoryStore {
     private let fileManager: FileManager
     private let fileURL: URL
+    private let legacyFileURL: URL
     private var entries: [String: LaunchHistoryEntry] = [:]
 
     init(fileManager: FileManager = .default) {
@@ -852,6 +853,9 @@ final class LaunchHistoryStore {
                 .appendingPathComponent("Library/Application Support", isDirectory: true)
 
         self.fileURL = applicationSupportURL
+            .appendingPathComponent("Tendon", isDirectory: true)
+            .appendingPathComponent("launch-history.json")
+        self.legacyFileURL = applicationSupportURL
             .appendingPathComponent("TakoLauncher", isDirectory: true)
             .appendingPathComponent("launch-history.json")
 
@@ -893,15 +897,29 @@ final class LaunchHistoryStore {
     }
 
     private func load() {
+        if let decodedEntries = entries(from: fileURL) {
+            entries = decodedEntries
+            return
+        }
+
+        if let decodedEntries = entries(from: legacyFileURL) {
+            entries = decodedEntries
+            save()
+            return
+        }
+
+        entries = [:]
+    }
+
+    private func entries(from fileURL: URL) -> [String: LaunchHistoryEntry]? {
         guard
             let data = try? Data(contentsOf: fileURL),
             let decodedEntries = try? JSONDecoder().decode([String: LaunchHistoryEntry].self, from: data)
         else {
-            entries = [:]
-            return
+            return nil
         }
 
-        entries = decodedEntries
+        return decodedEntries
     }
 
     private func save() {
@@ -2693,8 +2711,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "Tako"
-        item.button?.toolTip = "Tako Launcher"
+        item.button?.title = "Tendon"
+        item.button?.toolTip = "Tendon"
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(
@@ -2755,7 +2773,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        let hotKeyID = EventHotKeyID(signature: fourCharacterCode("TAKO"), id: 1)
+        let hotKeyID = EventHotKeyID(signature: fourCharacterCode("TNDN"), id: 1)
         let registerStatus = RegisterEventHotKey(
             UInt32(kVK_ANSI_N),
             UInt32(optionKey),
@@ -2772,7 +2790,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func reportHotKeyFailure(status: OSStatus) {
         fputs("Failed to register Option+N hotkey: \(status)\n", stderr)
-        statusItem?.button?.title = "Tako!"
+        statusItem?.button?.title = "Tendon!"
         statusItem?.button?.toolTip = "Option+N could not be registered"
     }
 

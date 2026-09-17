@@ -3,14 +3,14 @@
 import PackageDescription
 
 let package = Package(
-    name: "TakoLauncher",
+    name: "Tendon",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "TakoLauncher", targets: ["TakoLauncher"])
+        .executable(name: "Tendon", targets: ["Tendon"])
     ],
     targets: [
-        .executableTarget(name: "TakoLauncher")
+        .executableTarget(name: "Tendon", path: "Sources/TakoLauncher")
     ]
 )
