@@ -426,46 +426,31 @@ enum AppDiscovery {
             }
         }
 
+        let windowCandidates = windowCandidates(for: Array(appsByHistoryKey.values))
+        let windowCandidateProcessIdentifiers = Set(windowCandidates.compactMap(\.processIdentifier))
+        let applicationCandidates = appsByHistoryKey.values.filter { app in
+            guard
+                app.isRunning,
+                app.targetKind == .application,
+                let processIdentifier = app.processIdentifier
+            else {
+                return true
+            }
+
+            return !windowCandidateProcessIdentifiers.contains(processIdentifier)
+        }
+
         var candidatesByIdentityKey = Dictionary(
-            uniqueKeysWithValues: appsByHistoryKey.values.map { ($0.identityKey, $0) }
+            uniqueKeysWithValues: applicationCandidates.map { ($0.identityKey, $0) }
         )
 
-        for windowCandidate in windowCandidates(for: Array(appsByHistoryKey.values)) {
+        for windowCandidate in windowCandidates {
             candidatesByIdentityKey[windowCandidate.identityKey] = windowCandidate
         }
 
         return candidatesByIdentityKey.values.sorted {
             $0.name.localizedStandardCompare($1.name) == .orderedAscending
         }
-    }
-
-    static func candidateStatusReport(candidates: [LaunchableApp]) -> String {
-        let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
-        let workspaceRunningApps = NSWorkspace.shared.runningApplications.filter {
-            $0.processIdentifier != currentProcessIdentifier
-        }
-        let regularRunningApps = workspaceRunningApps.filter {
-            $0.activationPolicy == .regular
-        }
-        let coreGraphicsWindowOwnerCount = Set(
-            CoreGraphicsWindowReader.candidateWindows().map(\.ownerProcessIdentifier)
-        ).count
-        let discoverableRunningApps = runningApplications()
-        let runningCandidates = candidates.filter {
-            $0.isRunning && $0.targetKind == .application
-        }
-        let windowCandidates = candidates.filter {
-            $0.targetKind == .window
-        }
-        return """
-        Launcher candidates: \(candidates.count)
-        NSWorkspace running apps: \(workspaceRunningApps.count)
-        NSWorkspace regular running apps: \(regularRunningApps.count)
-        CoreGraphics window owner apps: \(coreGraphicsWindowOwnerCount)
-        Discoverable running apps: \(discoverableRunningApps.count)
-        Running app candidates: \(runningCandidates.count)
-        Window candidates: \(windowCandidates.count)
-        """
     }
 
     private static func applications(in root: URL, seenPaths: inout Set<String>) -> [LaunchableApp] {
@@ -937,8 +922,6 @@ final class LaunchHistoryStore {
 }
 
 enum WindowActivator {
-    private static var lastActivationLines: [String] = []
-
     private struct AXWindowsLookup {
         let windows: [AXUIElement]
         let error: AXError
@@ -990,19 +973,6 @@ enum WindowActivator {
         case .window:
             return activateWindow(for: app)
         }
-    }
-
-    static func statusReport() -> String {
-        #if DEBUG
-        guard !lastActivationLines.isEmpty else {
-            return "Last window activation: not attempted in this run"
-        }
-
-        return (["Last window activation:"] + lastActivationLines.map { "  \($0)" })
-            .joined(separator: "\n")
-        #else
-        return "Last window activation: debug details available in debug builds"
-        #endif
     }
 
     static func frontmostWindowTitle(for processIdentifier: pid_t) -> String? {
@@ -1909,7 +1879,6 @@ enum WindowActivator {
     }
 
     private static func recordActivation(_ lines: [String]) {
-        lastActivationLines = lines
         AppLog.write("window_activation", [
             "lines": lines
         ])
@@ -2121,7 +2090,6 @@ enum WindowActivator {
 enum WindowPermissionManager {
     private static var isStartupPermissionSequenceRunning = false
     private static var permissionPollTimer: Timer?
-    private static var lastScreenRecordingRequestStatus: String?
 
     static func requestStartupPermissions() {
         guard !isStartupPermissionSequenceRunning else {
@@ -2144,10 +2112,6 @@ enum WindowPermissionManager {
         requestAccessibilityPermission(onGranted: nil)
     }
 
-    static func requestScreenRecordingPermission() {
-        requestScreenRecordingPermission(onGranted: nil)
-    }
-
     private static func requestAccessibilityPermission(onGranted: (() -> Void)?) {
         guard !isAccessibilityGranted else {
             onGranted?()
@@ -2167,7 +2131,6 @@ enum WindowPermissionManager {
 
     private static func requestScreenRecordingPermission(onGranted: (() -> Void)?) {
         guard !isScreenRecordingGranted else {
-            lastScreenRecordingRequestStatus = "already granted"
             onGranted?()
             return
         }
@@ -2176,19 +2139,16 @@ enum WindowPermissionManager {
 
         Task {
             do {
-                let content = try await SCShareableContent.excludingDesktopWindows(
+                _ = try await SCShareableContent.excludingDesktopWindows(
                     false,
                     onScreenWindowsOnly: false
                 )
 
                 await MainActor.run {
-                    lastScreenRecordingRequestStatus = "success: \(content.windows.count) windows"
                     onGranted?()
                 }
             } catch {
                 await MainActor.run {
-                    lastScreenRecordingRequestStatus = "error: \(error.localizedDescription)"
-
                     if !isScreenRecordingGranted {
                         openScreenRecordingSettings()
                     }
@@ -2219,51 +2179,8 @@ enum WindowPermissionManager {
         }
     }
 
-    static func statusReport() -> String {
-        let accessibilityStatus = isAccessibilityGranted ? "granted" : "not granted"
-        let screenRecordingStatus = isScreenRecordingGranted ? "granted" : "not granted"
-        let coreGraphicsTitleCount = coreGraphicsWindowTitleCount()
-        let accessibilityTitleCount = isAccessibilityGranted ? accessibilityWindowTitleCount() : nil
-        let bundleIdentifier = Bundle.main.bundleIdentifier ?? "unknown"
-        let bundlePath = Bundle.main.bundleURL.path
-        let executablePath = Bundle.main.executableURL?.path ?? "unknown"
-        let appBundleStatus = Bundle.main.bundleURL.pathExtension == "app" ? "yes" : "no"
-        let startupSequenceStatus = isStartupPermissionSequenceRunning ? "running" : "idle"
-        let screenRequestLine = lastScreenRecordingRequestStatus.map {
-            "Last Screen Recording request: \($0)"
-        } ?? "Last Screen Recording request: not requested in this run"
-
-        let axLine = accessibilityTitleCount.map {
-            "Accessibility window titles visible: \($0)"
-        } ?? "Accessibility window titles visible: unavailable until Accessibility is granted"
-
-        return """
-        Bundle ID: \(bundleIdentifier)
-        App bundle: \(appBundleStatus)
-        Bundle path: \(bundlePath)
-        Executable: \(executablePath)
-
-        Accessibility: \(accessibilityStatus)
-        Screen Recording: \(screenRecordingStatus)
-        Startup permission sequence: \(startupSequenceStatus)
-        \(screenRequestLine)
-        CoreGraphics window titles visible: \(coreGraphicsTitleCount)
-        \(axLine)
-
-        If Screen Recording was just granted, quit and reopen TakoLauncher. macOS often applies that permission only after restart.
-        """
-    }
-
-    static func openAccessibilitySettings() {
-        openSettingsPane("x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility")
-    }
-
-    static func openScreenRecordingSettings() {
+    private static func openScreenRecordingSettings() {
         openSettingsPane("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
-    }
-
-    static func revealAppBundle() {
-        NSWorkspace.shared.activateFileViewerSelecting([Bundle.main.bundleURL])
     }
 
     private static func openSettingsPane(_ urlString: String) {
@@ -2280,54 +2197,6 @@ enum WindowPermissionManager {
 
     private static var isScreenRecordingGranted: Bool {
         CGPreflightScreenCaptureAccess()
-    }
-
-    private static func coreGraphicsWindowTitleCount() -> Int {
-        CoreGraphicsWindowReader.layerZeroWindows().filter(\.hasTitle).count
-    }
-
-    private static func accessibilityWindowTitleCount() -> Int {
-        NSWorkspace.shared.runningApplications.reduce(0) { count, runningApplication in
-            guard
-                runningApplication.processIdentifier != ProcessInfo.processInfo.processIdentifier,
-                runningApplication.activationPolicy == .regular
-            else {
-                return count
-            }
-
-            let applicationElement = AXUIElementCreateApplication(runningApplication.processIdentifier)
-            var windowsValue: CFTypeRef?
-            let windowsError = AXUIElementCopyAttributeValue(
-                applicationElement,
-                kAXWindowsAttribute as CFString,
-                &windowsValue
-            )
-
-            guard windowsError == .success, let windows = windowsValue as? [AXUIElement] else {
-                return count
-            }
-
-            let titledWindowCount = windows.reduce(0) { partialCount, window in
-                var titleValue: CFTypeRef?
-                let titleError = AXUIElementCopyAttributeValue(
-                    window,
-                    kAXTitleAttribute as CFString,
-                    &titleValue
-                )
-
-                guard
-                    titleError == .success,
-                    let title = (titleValue as? String)?.trimmingCharacters(in: .whitespacesAndNewlines),
-                    !title.isEmpty
-                else {
-                    return partialCount
-                }
-
-                return partialCount + 1
-            }
-
-            return count + titledWindowCount
-        }
     }
 }
 
@@ -2829,47 +2698,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let menu = NSMenu()
         menu.addItem(NSMenuItem(
-            title: "Show Launcher",
-            action: #selector(showLauncherFromMenu),
-            keyEquivalent: "n"
-        ))
-        menu.addItem(NSMenuItem(
-            title: "Rescan Applications",
-            action: #selector(rescanApplicationsFromMenu),
-            keyEquivalent: "r"
-        ))
-        menu.addItem(NSMenuItem(
-            title: "Request Accessibility Permission",
-            action: #selector(requestAccessibilityPermissionFromMenu),
-            keyEquivalent: ""
-        ))
-        menu.addItem(NSMenuItem(
-            title: "Request Screen Recording Permission",
-            action: #selector(requestScreenRecordingPermissionFromMenu),
-            keyEquivalent: ""
-        ))
-        menu.addItem(NSMenuItem(
-            title: "Show Window Permission Status",
-            action: #selector(showWindowPermissionStatusFromMenu),
-            keyEquivalent: ""
-        ))
-        menu.addItem(NSMenuItem(
-            title: "Open Accessibility Settings",
-            action: #selector(openAccessibilitySettingsFromMenu),
-            keyEquivalent: ""
-        ))
-        menu.addItem(NSMenuItem(
-            title: "Open Screen Recording Settings",
-            action: #selector(openScreenRecordingSettingsFromMenu),
-            keyEquivalent: ""
-        ))
-        menu.addItem(NSMenuItem(
-            title: "Reveal TakoLauncher in Finder",
-            action: #selector(revealTakoLauncherFromMenu),
-            keyEquivalent: ""
-        ))
-        menu.addItem(.separator())
-        menu.addItem(NSMenuItem(
             title: "Quit",
             action: #selector(quitFromMenu),
             keyEquivalent: "q"
@@ -2946,68 +2774,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         fputs("Failed to register Option+N hotkey: \(status)\n", stderr)
         statusItem?.button?.title = "Tako!"
         statusItem?.button?.toolTip = "Option+N could not be registered"
-    }
-
-    @objc private func showLauncherFromMenu() {
-        showLauncher()
-    }
-
-    @objc private func rescanApplicationsFromMenu() {
-        refreshApplications(force: true)
-        showLauncher()
-    }
-
-    @objc private func requestAccessibilityPermissionFromMenu() {
-        WindowPermissionManager.requestAccessibilityPermission()
-        refreshApplications(force: true)
-        showLauncher()
-    }
-
-    @objc private func requestScreenRecordingPermissionFromMenu() {
-        WindowPermissionManager.requestScreenRecordingPermission()
-        refreshApplications(force: true)
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
-            self?.showWindowPermissionStatusFromMenu()
-        }
-    }
-
-    @objc private func showWindowPermissionStatusFromMenu() {
-        refreshApplications(force: true)
-
-        let permissionStatus = WindowPermissionManager.statusReport()
-        let activationStatus = WindowActivator.statusReport()
-        let candidateStatus = AppDiscovery.candidateStatusReport(candidates: cachedApps)
-        AppLog.write("status_report", [
-            "permission_status": permissionStatus,
-            "activation_status": activationStatus,
-            "candidate_status": candidateStatus
-        ])
-
-        let alert = NSAlert()
-        alert.messageText = "Window Permission Status"
-        alert.informativeText = [
-            permissionStatus,
-            activationStatus,
-            candidateStatus
-        ].joined(separator: "\n\n")
-        alert.alertStyle = .informational
-        alert.addButton(withTitle: "OK")
-
-        NSApp.activate(ignoringOtherApps: true)
-        alert.runModal()
-    }
-
-    @objc private func openAccessibilitySettingsFromMenu() {
-        WindowPermissionManager.openAccessibilitySettings()
-    }
-
-    @objc private func openScreenRecordingSettingsFromMenu() {
-        WindowPermissionManager.openScreenRecordingSettings()
-    }
-
-    @objc private func revealTakoLauncherFromMenu() {
-        WindowPermissionManager.revealAppBundle()
     }
 
     @objc private func quitFromMenu() {
