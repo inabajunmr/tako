@@ -1,11 +1,114 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import Darwin
 import ScreenCaptureKit
+
+enum AppLog {
+    private static let queue = DispatchQueue(label: "TakoLauncher.AppLog")
+    private static let dateFormatter: ISO8601DateFormatter = {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        return formatter
+    }()
+    private static let fileNameFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .current
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter
+    }()
+
+    private static var fileURL: URL?
+
+    static func start() {
+        let logDirectoryURL = defaultLogDirectoryURL()
+        let startedAt = Date()
+        let logURL = logDirectoryURL
+            .appendingPathComponent("\(fileNameFormatter.string(from: startedAt)).jsonl")
+
+        do {
+            try FileManager.default.createDirectory(
+                at: logDirectoryURL,
+                withIntermediateDirectories: true
+            )
+            FileManager.default.createFile(atPath: logURL.path, contents: nil)
+            fileURL = logURL
+        } catch {
+            fputs("Failed to create log file: \(error.localizedDescription)\n", stderr)
+            return
+        }
+
+        write("app_start", [
+            "log_path": logURL.path,
+            "current_directory": FileManager.default.currentDirectoryPath,
+            "bundle_id": Bundle.main.bundleIdentifier ?? "unknown",
+            "bundle_path": Bundle.main.bundleURL.path,
+            "executable_path": Bundle.main.executableURL?.path ?? "unknown"
+        ])
+    }
+
+    static func write(_ event: String, _ fields: [String: Any] = [:]) {
+        guard let fileURL else {
+            return
+        }
+
+        var payload = fields
+        payload["event"] = event
+        payload["timestamp"] = dateFormatter.string(from: Date())
+
+        guard
+            JSONSerialization.isValidJSONObject(payload),
+            let data = try? JSONSerialization.data(withJSONObject: payload, options: [.sortedKeys]),
+            let line = String(data: data, encoding: .utf8)
+        else {
+            fputs("Failed to encode log event: \(event)\n", stderr)
+            return
+        }
+
+        queue.async {
+            do {
+                let handle = try FileHandle(forWritingTo: fileURL)
+                try handle.seekToEnd()
+                if let lineData = "\(line)\n".data(using: .utf8) {
+                    try handle.write(contentsOf: lineData)
+                }
+                try handle.close()
+            } catch {
+                fputs("Failed to write log event: \(error.localizedDescription)\n", stderr)
+            }
+        }
+    }
+
+    private static func defaultLogDirectoryURL() -> URL {
+        let bundleURL = Bundle.main.bundleURL
+
+        if
+            bundleURL.pathExtension == "app",
+            bundleURL.deletingLastPathComponent().lastPathComponent == "dist" {
+            return bundleURL
+                .deletingLastPathComponent()
+                .deletingLastPathComponent()
+                .appendingPathComponent("logs", isDirectory: true)
+        }
+
+        return URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        ).appendingPathComponent("logs", isDirectory: true)
+    }
+}
 
 enum LaunchTargetKind: Hashable {
     case application
     case window
+}
+
+struct WindowFrame: Hashable {
+    let x: Double
+    let y: Double
+    let width: Double
+    let height: Double
 }
 
 struct LaunchableApp: Hashable {
@@ -20,6 +123,8 @@ struct LaunchableApp: Hashable {
     let isRunning: Bool
     let targetKind: LaunchTargetKind
     let windowTitle: String?
+    let windowFrame: WindowFrame?
+    let windowIdentifier: UInt32?
 
     var subtitle: String {
         switch targetKind {
@@ -68,7 +173,9 @@ struct LaunchableApp: Hashable {
             processIdentifier: processIdentifier,
             isRunning: true,
             targetKind: targetKind,
-            windowTitle: windowTitle
+            windowTitle: windowTitle,
+            windowFrame: windowFrame,
+            windowIdentifier: windowIdentifier
         )
     }
 }
@@ -78,19 +185,18 @@ private struct CoreGraphicsWindowInfo {
     let ownerProcessIdentifier: pid_t
     let ownerName: String?
     let title: String?
-    let width: Double?
-    let height: Double?
+    let frame: WindowFrame?
 
     var hasTitle: Bool {
         title?.isEmpty == false
     }
 
     var isLargeEnoughForCandidate: Bool {
-        guard let width, let height else {
+        guard let frame else {
             return true
         }
 
-        return width >= 80 && height >= 40
+        return frame.width >= 80 && frame.height >= 40
     }
 }
 
@@ -115,8 +221,7 @@ private enum CoreGraphicsWindowReader {
             }
 
             let bounds = info[kCGWindowBounds as String] as? [String: Any]
-            let width = (bounds?["Width"] as? NSNumber)?.doubleValue
-            let height = (bounds?["Height"] as? NSNumber)?.doubleValue
+            let frame = windowFrame(from: bounds)
             let identifier = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value
 
             return CoreGraphicsWindowInfo(
@@ -124,8 +229,7 @@ private enum CoreGraphicsWindowReader {
                 ownerProcessIdentifier: ownerProcessIdentifier,
                 ownerName: trimmedString(info[kCGWindowOwnerName as String]),
                 title: trimmedString(info[kCGWindowName as String]),
-                width: width,
-                height: height
+                frame: frame
             )
         }
     }
@@ -141,6 +245,131 @@ private enum CoreGraphicsWindowReader {
 
         let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func windowFrame(from bounds: [String: Any]?) -> WindowFrame? {
+        guard
+            let x = (bounds?["X"] as? NSNumber)?.doubleValue,
+            let y = (bounds?["Y"] as? NSNumber)?.doubleValue,
+            let width = (bounds?["Width"] as? NSNumber)?.doubleValue,
+            let height = (bounds?["Height"] as? NSNumber)?.doubleValue
+        else {
+            return nil
+        }
+
+        return WindowFrame(x: x, y: y, width: width, height: height)
+    }
+}
+
+private enum AccessibilityWindowGeometry {
+    static func frame(of window: AXUIElement) -> WindowFrame? {
+        guard
+            let origin = pointAttribute(kAXPositionAttribute as CFString, of: window),
+            let size = sizeAttribute(kAXSizeAttribute as CFString, of: window)
+        else {
+            return nil
+        }
+
+        return WindowFrame(
+            x: origin.x,
+            y: origin.y,
+            width: size.width,
+            height: size.height
+        )
+    }
+
+    private static func pointAttribute(_ attribute: CFString, of element: AXUIElement) -> CGPoint? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+
+        guard error == .success, let value else {
+            return nil
+        }
+
+        var point = CGPoint.zero
+        guard AXValueGetValue((value as! AXValue), .cgPoint, &point) else {
+            return nil
+        }
+
+        return point
+    }
+
+    private static func sizeAttribute(_ attribute: CFString, of element: AXUIElement) -> CGSize? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+
+        guard error == .success, let value else {
+            return nil
+        }
+
+        var size = CGSize.zero
+        guard AXValueGetValue((value as! AXValue), .cgSize, &size) else {
+            return nil
+        }
+
+        return size
+    }
+}
+
+private struct AccessibilityWindowIdentifierLookup {
+    let identifier: UInt32?
+    let error: AXError?
+    let symbolName: String?
+}
+
+private enum AccessibilityWindowIdentity {
+    private typealias GetWindowFunction = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+
+    private static let resolvedFunction: (name: String, function: GetWindowFunction)? = {
+        guard let handle = dlopen(nil, RTLD_NOW) else {
+            return nil
+        }
+
+        for symbolName in ["_AXUIElementGetWindow", "AXUIElementGetWindow"] {
+            guard let symbol = dlsym(handle, symbolName) else {
+                continue
+            }
+
+            let function = unsafeBitCast(symbol, to: GetWindowFunction.self)
+            return (symbolName, function)
+        }
+
+        return nil
+    }()
+
+    static var availabilityDescription: String {
+        resolvedFunction.map { "\($0.name) available" } ?? "unavailable"
+    }
+
+    static func identifier(of window: AXUIElement) -> UInt32? {
+        lookup(of: window).identifier
+    }
+
+    static func lookup(of window: AXUIElement) -> AccessibilityWindowIdentifierLookup {
+        guard let resolvedFunction else {
+            return AccessibilityWindowIdentifierLookup(
+                identifier: nil,
+                error: nil,
+                symbolName: nil
+            )
+        }
+
+        var identifier = CGWindowID(0)
+        let error = resolvedFunction.function(window, &identifier)
+
+        guard error == .success, identifier != 0 else {
+            return AccessibilityWindowIdentifierLookup(
+                identifier: nil,
+                error: error,
+                symbolName: resolvedFunction.name
+            )
+        }
+
+        return AccessibilityWindowIdentifierLookup(
+            identifier: identifier,
+            error: error,
+            symbolName: resolvedFunction.name
+        )
     }
 }
 
@@ -296,7 +525,9 @@ enum AppDiscovery {
             processIdentifier: nil,
             isRunning: false,
             targetKind: .application,
-            windowTitle: nil
+            windowTitle: nil,
+            windowFrame: nil,
+            windowIdentifier: nil
         )
     }
 
@@ -402,7 +633,9 @@ enum AppDiscovery {
             processIdentifier: processIdentifier,
             isRunning: true,
             targetKind: .application,
-            windowTitle: nil
+            windowTitle: nil,
+            windowFrame: nil,
+            windowIdentifier: nil
         )
     }
 
@@ -453,7 +686,9 @@ enum AppDiscovery {
             }
 
             let title = candidate.windowTitle ?? candidate.name
-            let windowKey = "\(processIdentifier):\(title)"
+            let windowKey = candidate.windowIdentifier.map {
+                "\(processIdentifier):id:\($0)"
+            } ?? "\(processIdentifier):title:\(title)"
 
             guard !seenWindowKeys.contains(windowKey) else {
                 return
@@ -487,10 +722,17 @@ enum AppDiscovery {
                     return nil
                 }
 
+                let windowIdentifier = AccessibilityWindowIdentity.identifier(of: window)
+                let identityKey = windowIdentifier.map {
+                    "window:\(processIdentifier):ax-window-id:\($0)"
+                } ?? "window:\(processIdentifier):ax:\(index):\(title)"
+
                 return makeWindowCandidate(
                     baseApp: app,
                     title: title,
-                    identityKey: "window:\(processIdentifier):ax:\(index):\(title)"
+                    identityKey: identityKey,
+                    frame: AccessibilityWindowGeometry.frame(of: window),
+                    windowIdentifier: windowIdentifier
                 )
             }
         }
@@ -520,7 +762,9 @@ enum AppDiscovery {
             return makeWindowCandidate(
                 baseApp: baseApp,
                 title: title,
-                identityKey: identityKey
+                identityKey: identityKey,
+                frame: windowInfo.frame,
+                windowIdentifier: identifier
             )
         }
     }
@@ -528,7 +772,9 @@ enum AppDiscovery {
     private static func makeWindowCandidate(
         baseApp: LaunchableApp,
         title: String,
-        identityKey: String
+        identityKey: String,
+        frame: WindowFrame?,
+        windowIdentifier: UInt32?
     ) -> LaunchableApp {
         let searchText = [
             title,
@@ -554,7 +800,9 @@ enum AppDiscovery {
             processIdentifier: baseApp.processIdentifier,
             isRunning: true,
             targetKind: .window,
-            windowTitle: title
+            windowTitle: title,
+            windowFrame: frame,
+            windowIdentifier: windowIdentifier
         )
     }
 
@@ -683,12 +931,102 @@ final class LaunchHistoryStore {
 }
 
 enum WindowActivator {
-    static func activateWindow(for app: LaunchableApp) -> Bool {
+    private static var lastActivationLines: [String] = []
+
+    private struct AXWindowsLookup {
+        let windows: [AXUIElement]
+        let error: AXError
+        let valueDescription: String
+        let source: String
+        let manualAccessibilityError: AXError?
+        let childrenError: AXError?
+        let childrenValueDescription: String?
+        let childrenVisitedCount: Int?
+    }
+
+    private struct AXElementArrayLookup {
+        let elements: [AXUIElement]
+        let error: AXError
+        let valueDescription: String
+    }
+
+    private struct AXChildrenWindowLookup {
+        let windows: [AXUIElement]
+        let error: AXError
+        let valueDescription: String
+        let visitedCount: Int
+    }
+
+    private struct AXElementLookup {
+        let element: AXUIElement?
+        let error: AXError
+        let valueDescription: String
+    }
+
+    private struct AXMenuItemSearchResult {
+        let item: AXUIElement?
+        let visitedCount: Int
+        let visibleTitles: [String]
+    }
+
+    static func activate(
+        _ app: LaunchableApp,
+        previousFrontmostProcessIdentifier: pid_t?,
+        previousFrontmostWindowTitle: String?
+    ) -> Bool {
+        switch app.targetKind {
+        case .application:
+            return activateApplication(
+                for: app,
+                previousFrontmostProcessIdentifier: previousFrontmostProcessIdentifier,
+                previousFrontmostWindowTitle: previousFrontmostWindowTitle
+            )
+        case .window:
+            return activateWindow(for: app)
+        }
+    }
+
+    static func statusReport() -> String {
+        guard !lastActivationLines.isEmpty else {
+            return "Last window activation: not attempted in this run"
+        }
+
+        return (["Last window activation:"] + lastActivationLines.map { "  \($0)" })
+            .joined(separator: "\n")
+    }
+
+    static func frontmostWindowTitle(for processIdentifier: pid_t) -> String? {
+        accessibilityFocusedWindowTitle(for: processIdentifier) ?? CoreGraphicsWindowReader.candidateWindows().first {
+            $0.ownerProcessIdentifier == processIdentifier && $0.hasTitle
+        }?.title
+    }
+
+    private static func activateApplication(
+        for app: LaunchableApp,
+        previousFrontmostProcessIdentifier: pid_t?,
+        previousFrontmostWindowTitle: String?
+    ) -> Bool {
+        var lines = [
+            "context: application candidate",
+            "candidate: \(app.name)",
+            "previous pid: \(previousFrontmostProcessIdentifier.map(String.init) ?? "nil")",
+            "previous title: \(previousFrontmostWindowTitle ?? "nil")"
+        ]
+
         guard
-            app.targetKind == .window,
-            let processIdentifier = app.processIdentifier,
-            let runningApplication = NSRunningApplication(processIdentifier: processIdentifier)
+            app.isRunning,
+            let processIdentifier = app.processIdentifier
         else {
+            lines.append("result: skipped, candidate is not a running app with pid")
+            recordActivation(lines)
+            return false
+        }
+
+        lines.append("target pid: \(processIdentifier)")
+
+        guard let runningApplication = NSRunningApplication(processIdentifier: processIdentifier) else {
+            lines.append("result: skipped, NSRunningApplication not found")
+            recordActivation(lines)
             return false
         }
 
@@ -696,68 +1034,1070 @@ enum WindowActivator {
 
         guard AXIsProcessTrusted() else {
             WindowPermissionManager.requestAccessibilityPermission()
-            _ = runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            let activated = runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            lines.append("result: accessibility not trusted, fallback activate \(activated ? "true" : "false")")
+            recordActivation(lines)
+            return activated
+        }
+
+        let applicationElement = AXUIElementCreateApplication(processIdentifier)
+        let windowsLookup = windowsResult(in: applicationElement, enableManualAccessibility: true)
+        let windows = windowsLookup.windows
+        let targetWindows = candidateApplicationWindows(in: windows)
+        let shouldCycleWindow = previousFrontmostProcessIdentifier == processIdentifier
+        let coreGraphicsTitles = coreGraphicsWindowTitles(for: processIdentifier)
+
+        lines.append("same app as previous: \(shouldCycleWindow ? "true" : "false")")
+        lines.append("AXManualAccessibility set: \(formatOptionalError(windowsLookup.manualAccessibilityError))")
+        lines.append("AX windows copy error: \(describe(windowsLookup.error))")
+        lines.append("AX windows value: \(windowsLookup.valueDescription)")
+        lines.append("AX windows source: \(windowsLookup.source)")
+        lines.append("AX children copy error: \(formatOptionalError(windowsLookup.childrenError))")
+        lines.append("AX children value: \(windowsLookup.childrenValueDescription ?? "not attempted")")
+        lines.append("AX children visited: \(windowsLookup.childrenVisitedCount.map(String.init) ?? "not attempted")")
+        lines.append("AX windows: \(windows.count)")
+        lines.append("AX titled windows: \(targetWindows.count)")
+        lines.append("CG titles: \(formatTitles(coreGraphicsTitles))")
+
+        let targetWindow = targetApplicationWindow(
+            in: targetWindows,
+            processIdentifier: processIdentifier,
+            applicationElement: applicationElement,
+            shouldCycleWindow: shouldCycleWindow,
+            previousFrontmostWindowTitle: previousFrontmostWindowTitle
+        )
+
+        guard let targetWindow else {
+            let activated = runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            lines.append("result: no target AX window, fallback activate \(activated ? "true" : "false")")
+            recordActivation(lines)
+            return activated
+        }
+
+        raise(
+            targetWindow,
+            in: applicationElement,
+            runningApplication: runningApplication,
+            context: "application candidate",
+            processIdentifier: processIdentifier,
+            prefixLines: lines
+        )
+        return true
+    }
+
+    private static func activateWindow(for app: LaunchableApp) -> Bool {
+        var lines = [
+            "context: window candidate",
+            "candidate: \(app.name)",
+            "candidate window title: \(app.windowTitle ?? "nil")",
+            "candidate window id: \(formatIdentifier(app.windowIdentifier))",
+            "candidate frame: \(formatFrame(app.windowFrame))"
+        ]
+
+        guard
+            app.targetKind == .window,
+            let processIdentifier = app.processIdentifier
+        else {
+            lines.append("result: skipped, candidate is not a window with pid")
+            recordActivation(lines)
+            return false
+        }
+
+        lines.append("target pid: \(processIdentifier)")
+
+        guard let runningApplication = NSRunningApplication(processIdentifier: processIdentifier) else {
+            lines.append("result: skipped, NSRunningApplication not found")
+            recordActivation(lines)
+            return false
+        }
+
+        runningApplication.unhide()
+
+        guard AXIsProcessTrusted() else {
+            WindowPermissionManager.requestAccessibilityPermission()
+            let activated = runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            lines.append("result: accessibility not trusted, fallback activate \(activated ? "true" : "false")")
+            recordActivation(lines)
             return false
         }
 
         let applicationElement = AXUIElementCreateApplication(processIdentifier)
+        let windowsLookup = windowsResult(in: applicationElement, enableManualAccessibility: true)
+        let axWindows = windowsLookup.windows
+        lines.append("AX window id symbol: \(AccessibilityWindowIdentity.availabilityDescription)")
+        lines.append("AXManualAccessibility set: \(formatOptionalError(windowsLookup.manualAccessibilityError))")
+        lines.append("AX windows copy error: \(describe(windowsLookup.error))")
+        lines.append("AX windows value: \(windowsLookup.valueDescription)")
+        lines.append("AX windows source: \(windowsLookup.source)")
+        lines.append("AX children copy error: \(formatOptionalError(windowsLookup.childrenError))")
+        lines.append("AX children value: \(windowsLookup.childrenValueDescription ?? "not attempted")")
+        lines.append("AX children visited: \(windowsLookup.childrenVisitedCount.map(String.init) ?? "not attempted")")
+        lines.append("AX windows: \(axWindows.count)")
+        lines.append("AX frames: \(formatAXWindows(axWindows))")
 
-        guard let targetWindow = findWindow(in: applicationElement, matching: app.windowTitle) else {
-            _ = runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+        var targetWindow = findWindow(
+            in: axWindows,
+            matching: app.windowTitle,
+            identifier: app.windowIdentifier,
+            frame: app.windowFrame
+        )
+
+        if targetWindow == nil, windowsLookup.source != "AXChildren" {
+            let childrenLookup = childWindows(in: applicationElement)
+            lines.append("secondary AX children copy error: \(describe(childrenLookup.error))")
+            lines.append("secondary AX children value: \(childrenLookup.valueDescription)")
+            lines.append("secondary AX children visited: \(childrenLookup.visitedCount)")
+            lines.append("secondary AX children windows: \(childrenLookup.windows.count)")
+            lines.append("secondary AX children frames: \(formatAXWindows(childrenLookup.windows))")
+            targetWindow = findWindow(
+                in: childrenLookup.windows,
+                matching: app.windowTitle,
+                identifier: app.windowIdentifier,
+                frame: app.windowFrame
+            )
+        }
+
+        if targetWindow == nil {
+            targetWindow = hitTestWindow(for: app, processIdentifier: processIdentifier, lines: &lines)
+        }
+
+        if targetWindow == nil,
+            pressWindowMenuItem(
+                for: app,
+                in: applicationElement,
+                runningApplication: runningApplication,
+                lines: &lines
+            ) {
+            recordActivation(lines)
+            return true
+        }
+
+        guard let targetWindow else {
+            lines.append("result: target AX window not found")
+            recordActivation(lines)
             return false
         }
 
-        AXUIElementSetAttributeValue(
+        raise(
             targetWindow,
-            kAXMinimizedAttribute as CFString,
-            kCFBooleanFalse
+            in: applicationElement,
+            runningApplication: runningApplication,
+            context: "window candidate",
+            processIdentifier: processIdentifier,
+            prefixLines: lines
         )
-
-        _ = runningApplication.activate(options: [.activateIgnoringOtherApps])
-        AXUIElementSetAttributeValue(
-            applicationElement,
-            kAXFocusedWindowAttribute as CFString,
-            targetWindow
-        )
-        AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
 
         return true
     }
 
-    private static func findWindow(in applicationElement: AXUIElement, matching targetTitle: String?) -> AXUIElement? {
-        let windows = windows(in: applicationElement)
-
-        guard let targetTitle else {
-            return windows.first
+    private static func targetApplicationWindow(
+        in windows: [AXUIElement],
+        processIdentifier: pid_t,
+        applicationElement: AXUIElement,
+        shouldCycleWindow: Bool,
+        previousFrontmostWindowTitle: String?
+    ) -> AXUIElement? {
+        guard !windows.isEmpty else {
+            return nil
         }
 
-        if let exactMatch = windows.first(where: { title(of: $0) == targetTitle }) {
+        guard shouldCycleWindow, windows.count > 1 else {
+            return focusedWindow(in: applicationElement) ?? windows.first
+        }
+
+        if
+            let previousFrontmostWindowTitle,
+            let nextWindowTitle = nextWindowTitle(
+                after: previousFrontmostWindowTitle,
+                for: processIdentifier
+            ),
+            let nextWindow = findWindow(in: windows, matching: nextWindowTitle) {
+            return nextWindow
+        }
+
+        if
+            let previousFrontmostWindowTitle,
+            let previousIndex = firstWindowIndex(in: windows, matching: previousFrontmostWindowTitle) {
+            return windows[(previousIndex + 1) % windows.count]
+        }
+
+        guard
+            let focusedWindow = focusedWindow(in: applicationElement),
+            let focusedIndex = windows.firstIndex(where: { CFEqual($0, focusedWindow) })
+        else {
+            return windows.dropFirst().first ?? windows.first
+        }
+
+        return windows[(focusedIndex + 1) % windows.count]
+    }
+
+    private static func nextWindowTitle(after currentTitle: String, for processIdentifier: pid_t) -> String? {
+        let orderedTitles = deduplicate(
+            CoreGraphicsWindowReader.candidateWindows()
+                .filter { $0.ownerProcessIdentifier == processIdentifier && $0.hasTitle }
+                .compactMap(\.title)
+        )
+
+        guard orderedTitles.count > 1 else {
+            return nil
+        }
+
+        guard let currentIndex = orderedTitles.firstIndex(where: { titlesMatch($0, currentTitle) }) else {
+            return orderedTitles.first
+        }
+
+        return orderedTitles[(currentIndex + 1) % orderedTitles.count]
+    }
+
+    private static func deduplicate(_ titles: [String]) -> [String] {
+        var seen = Set<String>()
+        var result: [String] = []
+
+        for title in titles {
+            let key = title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            guard !seen.contains(key) else {
+                continue
+            }
+
+            seen.insert(key)
+            result.append(title)
+        }
+
+        return result
+    }
+
+    private static func firstWindowIndex(in windows: [AXUIElement], matching targetTitle: String) -> Int? {
+        if let exactMatch = windows.firstIndex(where: { title(of: $0) == targetTitle }) {
             return exactMatch
         }
 
-        return windows.first { window in
+        return windows.firstIndex { window in
             guard let windowTitle = title(of: window) else {
                 return false
             }
 
-            return windowTitle.localizedCaseInsensitiveContains(targetTitle) ||
-                targetTitle.localizedCaseInsensitiveContains(windowTitle)
+            return titlesMatch(windowTitle, targetTitle)
         }
     }
 
-    private static func windows(in applicationElement: AXUIElement) -> [AXUIElement] {
-        var value: CFTypeRef?
-        let error = AXUIElementCopyAttributeValue(
-            applicationElement,
-            kAXWindowsAttribute as CFString,
-            &value
-        )
+    private static func candidateApplicationWindows(in windows: [AXUIElement]) -> [AXUIElement] {
+        let titledWindows = windows.filter { window in
+            title(of: window)?.isEmpty == false
+        }
 
-        guard error == .success, let windows = value as? [AXUIElement] else {
-            return []
+        return titledWindows.isEmpty ? windows : titledWindows
+    }
+
+    private static func raise(
+        _ targetWindow: AXUIElement,
+        in applicationElement: AXUIElement,
+        runningApplication: NSRunningApplication,
+        context: String,
+        processIdentifier: pid_t,
+        prefixLines: [String] = []
+    ) {
+        let targetTitle = title(of: targetWindow) ?? "(untitled)"
+        var lines = prefixLines + [
+            "activation context: \(context)",
+            "activation pid: \(processIdentifier)",
+            "target title: \(targetTitle)"
+        ]
+
+        let unminimizeError = AXUIElementSetAttributeValue(
+            targetWindow,
+            kAXMinimizedAttribute as CFString,
+            kCFBooleanFalse
+        )
+        lines.append("set AXMinimized=false: \(describe(unminimizeError))")
+
+        let mainError = AXUIElementSetAttributeValue(
+            targetWindow,
+            kAXMainAttribute as CFString,
+            kCFBooleanTrue
+        )
+        lines.append("set window AXMain=true: \(describe(mainError))")
+
+        let focusedError = AXUIElementSetAttributeValue(
+            targetWindow,
+            kAXFocusedAttribute as CFString,
+            kCFBooleanTrue
+        )
+        lines.append("set window AXFocused=true: \(describe(focusedError))")
+
+        let mainWindowError = AXUIElementSetAttributeValue(
+            applicationElement,
+            kAXMainWindowAttribute as CFString,
+            targetWindow
+        )
+        lines.append("set app AXMainWindow: \(describe(mainWindowError))")
+
+        let focusedWindowError = AXUIElementSetAttributeValue(
+            applicationElement,
+            kAXFocusedWindowAttribute as CFString,
+            targetWindow
+        )
+        lines.append("set app AXFocusedWindow: \(describe(focusedWindowError))")
+
+        let frontmostError = AXUIElementSetAttributeValue(
+            applicationElement,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        lines.append("set app AXFrontmost=true: \(describe(frontmostError))")
+
+        let activated = runningApplication.activate(options: [.activateIgnoringOtherApps])
+        lines.append("NSRunningApplication.activate: \(activated ? "true" : "false")")
+
+        let raiseError = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+        lines.append("perform AXRaise: \(describe(raiseError))")
+
+        recordActivation(lines)
+    }
+
+    private static func findWindow(in applicationElement: AXUIElement, matching targetTitle: String?) -> AXUIElement? {
+        let windows = windows(in: applicationElement)
+        return findWindow(in: windows, matching: targetTitle, identifier: nil, frame: nil)
+    }
+
+    private static func findWindow(
+        in windows: [AXUIElement],
+        matching targetTitle: String?,
+        identifier targetIdentifier: UInt32? = nil,
+        frame targetFrame: WindowFrame? = nil
+    ) -> AXUIElement? {
+        if
+            let targetIdentifier,
+            let identifierMatch = windows.first(where: {
+                AccessibilityWindowIdentity.identifier(of: $0) == targetIdentifier
+            }) {
+            return identifierMatch
+        }
+
+        let fallbackWindows: [AXUIElement]
+        if targetIdentifier == nil {
+            fallbackWindows = windows
+        } else {
+            fallbackWindows = windows.filter {
+                AccessibilityWindowIdentity.identifier(of: $0) == nil
+            }
+        }
+
+        if let targetTitle, let exactMatch = fallbackWindows.first(where: { title(of: $0) == targetTitle }) {
+            return exactMatch
+        }
+
+        if let targetTitle {
+            return fallbackWindows.first { window in
+                guard let windowTitle = title(of: window) else {
+                    return false
+                }
+
+                return titlesAreCompatible(windowTitle, targetTitle)
+            }
+        }
+
+        if
+            targetIdentifier == nil,
+            let frameMatch = findWindow(in: fallbackWindows, matching: targetFrame) {
+            return frameMatch
+        }
+
+        if targetIdentifier == nil {
+            return fallbackWindows.first
+        }
+
+        return nil
+    }
+
+    private static func findWindow(in windows: [AXUIElement], matching targetFrame: WindowFrame?) -> AXUIElement? {
+        guard let targetFrame else {
+            return nil
         }
 
         return windows
+            .compactMap { window -> (AXUIElement, Double)? in
+                guard let frame = AccessibilityWindowGeometry.frame(of: window) else {
+                    return nil
+                }
+
+                return (window, frameDistance(frame, targetFrame))
+            }
+            .filter { _, distance in distance <= 96 }
+            .min { lhs, rhs in lhs.1 < rhs.1 }?
+            .0
+    }
+
+    private static func titlesMatch(_ lhs: String, _ rhs: String) -> Bool {
+        lhs.compare(
+            rhs,
+            options: [.caseInsensitive, .diacriticInsensitive]
+        ) == .orderedSame
+    }
+
+    private static func titlesAreCompatible(_ lhs: String, _ rhs: String) -> Bool {
+        titlesMatch(lhs, rhs) ||
+            lhs.localizedCaseInsensitiveContains(rhs) ||
+            rhs.localizedCaseInsensitiveContains(lhs)
+    }
+
+    private static func hitTestWindow(
+        for app: LaunchableApp,
+        processIdentifier: pid_t,
+        lines: inout [String]
+    ) -> AXUIElement? {
+        guard let frame = app.windowFrame else {
+            lines.append("AX hit test: skipped, no candidate frame")
+            return nil
+        }
+
+        let systemWideElement = AXUIElementCreateSystemWide()
+        let points = hitTestPoints(in: frame)
+
+        for (index, point) in points.enumerated() {
+            var element: AXUIElement?
+            let error = AXUIElementCopyElementAtPosition(
+                systemWideElement,
+                Float(point.x),
+                Float(point.y),
+                &element
+            )
+            lines.append("AX hit test \(index) at x:\(Int(point.x)) y:\(Int(point.y)): \(describe(error))")
+
+            guard error == .success, let element else {
+                continue
+            }
+
+            let elementPID = pid(of: element)
+            let elementRole = role(of: element) ?? "nil"
+            let elementTitle = title(of: element) ?? "(untitled)"
+            lines.append(
+                "AX hit test element: pid \(formatPID(elementPID)) role \(elementRole) title \(elementTitle)"
+            )
+
+            guard let window = relatedWindow(of: element) else {
+                lines.append("AX hit test result: no related AX window")
+                continue
+            }
+
+            let windowPID = pid(of: window)
+            let windowIdentifierLookup = AccessibilityWindowIdentity.lookup(of: window)
+            let windowTitle = title(of: window) ?? "(untitled)"
+            lines.append(
+                "AX hit test window: pid \(formatPID(windowPID)) id \(formatWindowIdentifierLookup(windowIdentifierLookup)) title \(windowTitle) frame \(formatFrame(AccessibilityWindowGeometry.frame(of: window)))"
+            )
+
+            guard windowPID == processIdentifier else {
+                lines.append("AX hit test rejected: pid mismatch")
+                continue
+            }
+
+            guard windowMatchesTarget(window, title: app.windowTitle, identifier: app.windowIdentifier) else {
+                lines.append("AX hit test rejected: target id/title mismatch")
+                continue
+            }
+
+            lines.append("AX hit test result: matched target window")
+            return window
+        }
+
+        lines.append("AX hit test result: no matched window")
+        return nil
+    }
+
+    private static func pressWindowMenuItem(
+        for app: LaunchableApp,
+        in applicationElement: AXUIElement,
+        runningApplication: NSRunningApplication,
+        lines: inout [String]
+    ) -> Bool {
+        guard let targetTitle = app.windowTitle else {
+            lines.append("Window menu fallback: skipped, no target title")
+            return false
+        }
+
+        let frontmostError = AXUIElementSetAttributeValue(
+            applicationElement,
+            kAXFrontmostAttribute as CFString,
+            kCFBooleanTrue
+        )
+        lines.append("Window menu fallback set app AXFrontmost=true: \(describe(frontmostError))")
+
+        let activated = runningApplication.activate(options: [.activateIgnoringOtherApps])
+        lines.append("Window menu fallback activate app: \(activated ? "true" : "false")")
+        Thread.sleep(forTimeInterval: 0.18)
+
+        let menuBarLookup = elementAttribute(
+            kAXMenuBarAttribute as CFString,
+            of: applicationElement
+        )
+        lines.append(
+            "Window menu fallback menu bar: \(describe(menuBarLookup.error)) \(menuBarLookup.valueDescription)"
+        )
+
+        guard let menuBar = menuBarLookup.element else {
+            lines.append("Window menu fallback result: no menu bar")
+            return false
+        }
+
+        let menuBarItemsLookup = elementArray(
+            attribute: kAXChildrenAttribute as CFString,
+            of: menuBar
+        )
+        let menuBarItems = menuBarItemsLookup.elements
+        let menuBarTitles = menuBarItems.compactMap { title(of: $0) }
+        lines.append("Window menu fallback menu bar items: \(formatTitles(menuBarTitles))")
+
+        let windowMenuItems = menuBarItems.filter {
+            title(of: $0).map(isWindowMenuTitle) == true
+        }
+
+        guard !windowMenuItems.isEmpty else {
+            lines.append("Window menu fallback result: Window menu not found")
+            return false
+        }
+
+        for windowMenuItem in windowMenuItems {
+            let windowMenuTitle = title(of: windowMenuItem) ?? "(untitled)"
+            let initialSearch = menuItem(in: windowMenuItem, matching: targetTitle)
+            lines.append(
+                "Window menu fallback initial search in \(windowMenuTitle): visited \(initialSearch.visitedCount), titles \(formatTitles(initialSearch.visibleTitles))"
+            )
+
+            if let item = initialSearch.item {
+                return pressMenuItem(
+                    item,
+                    targetTitle: targetTitle,
+                    source: "initial",
+                    runningApplication: runningApplication,
+                    lines: &lines
+                )
+            }
+
+            let openError = AXUIElementPerformAction(windowMenuItem, kAXPressAction as CFString)
+            lines.append("Window menu fallback open \(windowMenuTitle): \(describe(openError))")
+            Thread.sleep(forTimeInterval: 0.12)
+
+            let openedSearch = menuItem(in: windowMenuItem, matching: targetTitle)
+            lines.append(
+                "Window menu fallback opened search in \(windowMenuTitle): visited \(openedSearch.visitedCount), titles \(formatTitles(openedSearch.visibleTitles))"
+            )
+
+            if let item = openedSearch.item {
+                return pressMenuItem(
+                    item,
+                    targetTitle: targetTitle,
+                    source: "opened",
+                    runningApplication: runningApplication,
+                    lines: &lines
+                )
+            }
+        }
+
+        lines.append("Window menu fallback result: no matching menu item")
+        return false
+    }
+
+    private static func pressMenuItem(
+        _ menuItem: AXUIElement,
+        targetTitle: String,
+        source: String,
+        runningApplication: NSRunningApplication,
+        lines: inout [String]
+    ) -> Bool {
+        let menuItemTitle = title(of: menuItem) ?? "(untitled)"
+        let pressError = AXUIElementPerformAction(menuItem, kAXPressAction as CFString)
+        lines.append(
+            "Window menu fallback press \(source): target \(targetTitle), item \(menuItemTitle), \(describe(pressError))"
+        )
+
+        guard pressError == .success else {
+            lines.append("Window menu fallback result: press failed")
+            return false
+        }
+
+        Thread.sleep(forTimeInterval: 0.45)
+        let observedTitle = frontmostWindowTitle(for: runningApplication.processIdentifier)
+        lines.append("Window menu fallback observed title after press: \(observedTitle ?? "nil")")
+
+        guard
+            let observedTitle,
+            menuItemTitleMatches(observedTitle, targetTitle)
+        else {
+            lines.append("Window menu fallback result: press succeeded but target title not observed")
+            return false
+        }
+
+        lines.append("Window menu fallback result: pressed and observed matching Window menu item")
+        return true
+    }
+
+    private static func menuItem(in root: AXUIElement, matching targetTitle: String) -> AXMenuItemSearchResult {
+        var queue = [(root, 0)]
+        var visibleTitles: [String] = []
+        var visitedCount = 0
+        let maxDepth = 8
+        let maxVisitedCount = 700
+
+        while !queue.isEmpty, visitedCount < maxVisitedCount {
+            let (element, depth) = queue.removeFirst()
+            visitedCount += 1
+
+            let elementRole = role(of: element)
+            if
+                elementRole == (kAXMenuItemRole as String),
+                let elementTitle = title(of: element),
+                !elementTitle.isEmpty {
+                visibleTitles.append(elementTitle)
+
+                if menuItemTitleMatches(elementTitle, targetTitle), isEnabled(element) {
+                    return AXMenuItemSearchResult(
+                        item: element,
+                        visitedCount: visitedCount,
+                        visibleTitles: visibleTitles
+                    )
+                }
+            }
+
+            guard depth < maxDepth else {
+                continue
+            }
+
+            let childrenLookup = elementArray(
+                attribute: kAXChildrenAttribute as CFString,
+                of: element
+            )
+            queue.append(contentsOf: childrenLookup.elements.map { ($0, depth + 1) })
+        }
+
+        return AXMenuItemSearchResult(
+            item: nil,
+            visitedCount: visitedCount,
+            visibleTitles: visibleTitles
+        )
+    }
+
+    private static func hitTestPoints(in frame: WindowFrame) -> [CGPoint] {
+        let insetX = min(max(frame.width * 0.08, 32), max(frame.width / 2, 1))
+        let insetY = min(max(frame.height * 0.08, 32), max(frame.height / 2, 1))
+
+        return [
+            CGPoint(x: frame.x + frame.width / 2, y: frame.y + frame.height / 2),
+            CGPoint(x: frame.x + insetX, y: frame.y + insetY),
+            CGPoint(x: frame.x + frame.width - insetX, y: frame.y + insetY)
+        ]
+    }
+
+    private static func relatedWindow(of element: AXUIElement) -> AXUIElement? {
+        if role(of: element) == (kAXWindowRole as String) {
+            return element
+        }
+
+        return axElementAttribute("AXWindow" as CFString, of: element) ??
+            axElementAttribute("AXTopLevelUIElement" as CFString, of: element)
+    }
+
+    private static func elementAttribute(_ attribute: CFString, of element: AXUIElement) -> AXElementLookup {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+
+        guard error == .success else {
+            return AXElementLookup(
+                element: nil,
+                error: error,
+                valueDescription: describeAXValue(value)
+            )
+        }
+
+        guard
+            let value,
+            CFGetTypeID(value) == AXUIElementGetTypeID()
+        else {
+            return AXElementLookup(
+                element: nil,
+                error: error,
+                valueDescription: describeAXValue(value)
+            )
+        }
+
+        return AXElementLookup(
+            element: (value as! AXUIElement),
+            error: error,
+            valueDescription: "AXUIElement"
+        )
+    }
+
+    private static func axElementAttribute(_ attribute: CFString, of element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(element, attribute, &value)
+
+        guard
+            error == .success,
+            let value,
+            CFGetTypeID(value) == AXUIElementGetTypeID()
+        else {
+            return nil
+        }
+
+        return (value as! AXUIElement)
+    }
+
+    private static func isWindowMenuTitle(_ title: String) -> Bool {
+        let normalized = title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        return normalized.compare("Window", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame ||
+            normalized.compare("Windows", options: [.caseInsensitive, .diacriticInsensitive]) == .orderedSame ||
+            normalized == "ウインドウ" ||
+            normalized == "ウィンドウ"
+    }
+
+    private static func menuItemTitleMatches(_ menuItemTitle: String, _ targetTitle: String) -> Bool {
+        let normalizedMenuItemTitle = normalizedWindowMenuTitle(menuItemTitle)
+        let normalizedTargetTitle = normalizedWindowMenuTitle(targetTitle)
+
+        guard !normalizedMenuItemTitle.isEmpty, !normalizedTargetTitle.isEmpty else {
+            return false
+        }
+
+        return normalizedMenuItemTitle == normalizedTargetTitle ||
+            normalizedMenuItemTitle.contains(normalizedTargetTitle) ||
+            normalizedTargetTitle.contains(normalizedMenuItemTitle)
+    }
+
+    private static func normalizedWindowMenuTitle(_ title: String) -> String {
+        var normalized = title.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        while let first = normalized.first, "✓✔•".contains(first) {
+            normalized.removeFirst()
+            normalized = normalized.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        if let shortcutRange = normalized.range(
+            of: #"^\d+[\.)]?\s+"#,
+            options: .regularExpression
+        ) {
+            normalized.removeSubrange(shortcutRange)
+        }
+
+        return normalized
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+    }
+
+    private static func windowMatchesTarget(
+        _ window: AXUIElement,
+        title targetTitle: String?,
+        identifier targetIdentifier: UInt32?
+    ) -> Bool {
+        if
+            let targetIdentifier {
+            let lookup = AccessibilityWindowIdentity.lookup(of: window)
+
+            if let identifier = lookup.identifier {
+                return identifier == targetIdentifier
+            }
+        }
+
+        if
+            let targetTitle,
+            let windowTitle = title(of: window) {
+            return titlesAreCompatible(windowTitle, targetTitle)
+        }
+
+        return targetTitle == nil && targetIdentifier == nil
+    }
+
+    private static func isEnabled(_ element: AXUIElement) -> Bool {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            element,
+            kAXEnabledAttribute as CFString,
+            &value
+        )
+
+        guard error == .success else {
+            return true
+        }
+
+        return (value as? Bool) ?? true
+    }
+
+    private static func coreGraphicsWindowTitles(for processIdentifier: pid_t) -> [String] {
+        deduplicate(
+            CoreGraphicsWindowReader.candidateWindows()
+                .filter { $0.ownerProcessIdentifier == processIdentifier && $0.hasTitle }
+                .compactMap(\.title)
+        )
+    }
+
+    private static func formatTitles(_ titles: [String]) -> String {
+        guard !titles.isEmpty else {
+            return "none"
+        }
+
+        return titles.prefix(6).joined(separator: " | ")
+    }
+
+    private static func formatAXWindows(_ windows: [AXUIElement]) -> String {
+        guard !windows.isEmpty else {
+            return "none"
+        }
+
+        return windows.prefix(6).map { window in
+            let windowTitle = title(of: window) ?? "(untitled)"
+            let identifierLookup = AccessibilityWindowIdentity.lookup(of: window)
+            return "pid:\(formatPID(pid(of: window))) id:\(formatWindowIdentifierLookup(identifierLookup)) \(windowTitle) \(formatFrame(AccessibilityWindowGeometry.frame(of: window)))"
+        }.joined(separator: " | ")
+    }
+
+    private static func formatIdentifier(_ identifier: UInt32?) -> String {
+        identifier.map(String.init) ?? "nil"
+    }
+
+    private static func formatWindowIdentifierLookup(_ lookup: AccessibilityWindowIdentifierLookup) -> String {
+        if let identifier = lookup.identifier {
+            return "\(identifier) via \(lookup.symbolName ?? "unknown")"
+        }
+
+        if let error = lookup.error {
+            return "nil via \(lookup.symbolName ?? "unknown") \(describe(error))"
+        }
+
+        return "nil (symbol unavailable)"
+    }
+
+    private static func formatPID(_ processIdentifier: pid_t?) -> String {
+        processIdentifier.map(String.init) ?? "nil"
+    }
+
+    private static func formatFrame(_ frame: WindowFrame?) -> String {
+        guard let frame else {
+            return "nil"
+        }
+
+        return "x:\(Int(frame.x)) y:\(Int(frame.y)) w:\(Int(frame.width)) h:\(Int(frame.height))"
+    }
+
+    private static func frameDistance(_ lhs: WindowFrame, _ rhs: WindowFrame) -> Double {
+        abs(lhs.x - rhs.x) +
+            abs(lhs.y - rhs.y) +
+            abs(lhs.width - rhs.width) +
+            abs(lhs.height - rhs.height)
+    }
+
+    private static func describe(_ error: AXError) -> String {
+        error == .success ? "success" : "error \(error.rawValue)"
+    }
+
+    private static func formatOptionalError(_ error: AXError?) -> String {
+        error.map(describe) ?? "not attempted"
+    }
+
+    private static func pid(of element: AXUIElement) -> pid_t? {
+        var processIdentifier = pid_t(0)
+        let error = AXUIElementGetPid(element, &processIdentifier)
+
+        guard error == .success else {
+            return nil
+        }
+
+        return processIdentifier
+    }
+
+    private static func recordActivation(_ lines: [String]) {
+        lastActivationLines = lines
+        AppLog.write("window_activation", [
+            "lines": lines
+        ])
+    }
+
+    private static func windowsResult(
+        in applicationElement: AXUIElement,
+        enableManualAccessibility: Bool = false
+    ) -> AXWindowsLookup {
+        let manualAccessibilityError: AXError?
+
+        if enableManualAccessibility {
+            manualAccessibilityError = AXUIElementSetAttributeValue(
+                applicationElement,
+                "AXManualAccessibility" as CFString,
+                kCFBooleanTrue
+            )
+            Thread.sleep(forTimeInterval: 0.12)
+        } else {
+            manualAccessibilityError = nil
+        }
+
+        let directLookup = elementArray(
+            attribute: kAXWindowsAttribute as CFString,
+            of: applicationElement
+        )
+
+        if !directLookup.elements.isEmpty {
+            return AXWindowsLookup(
+                windows: directLookup.elements,
+                error: directLookup.error,
+                valueDescription: directLookup.valueDescription,
+                source: "AXWindows",
+                manualAccessibilityError: manualAccessibilityError,
+                childrenError: nil,
+                childrenValueDescription: nil,
+                childrenVisitedCount: nil
+            )
+        }
+
+        let childrenLookup = childWindows(in: applicationElement)
+        if !childrenLookup.windows.isEmpty {
+            return AXWindowsLookup(
+                windows: childrenLookup.windows,
+                error: directLookup.error,
+                valueDescription: directLookup.valueDescription,
+                source: "AXChildren",
+                manualAccessibilityError: manualAccessibilityError,
+                childrenError: childrenLookup.error,
+                childrenValueDescription: childrenLookup.valueDescription,
+                childrenVisitedCount: childrenLookup.visitedCount
+            )
+        }
+
+        return AXWindowsLookup(
+            windows: [],
+            error: directLookup.error,
+            valueDescription: directLookup.valueDescription,
+            source: "none",
+            manualAccessibilityError: manualAccessibilityError,
+            childrenError: childrenLookup.error,
+            childrenValueDescription: childrenLookup.valueDescription,
+            childrenVisitedCount: childrenLookup.visitedCount
+        )
+    }
+
+    private static func elementArray(attribute: CFString, of element: AXUIElement) -> AXElementArrayLookup {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            element,
+            attribute,
+            &value
+        )
+
+        guard error == .success else {
+            return AXElementArrayLookup(
+                elements: [],
+                error: error,
+                valueDescription: describeAXValue(value)
+            )
+        }
+
+        guard let elements = value as? [AXUIElement] else {
+            return AXElementArrayLookup(
+                elements: [],
+                error: error,
+                valueDescription: describeAXValue(value)
+            )
+        }
+
+        return AXElementArrayLookup(
+            elements: elements,
+            error: error,
+            valueDescription: "AXUIElement array count \(elements.count)"
+        )
+    }
+
+    private static func childWindows(in applicationElement: AXUIElement) -> AXChildrenWindowLookup {
+        let rootChildrenLookup = elementArray(
+            attribute: kAXChildrenAttribute as CFString,
+            of: applicationElement
+        )
+        var queue = rootChildrenLookup.elements.map { ($0, 1) }
+        var windows: [AXUIElement] = []
+        var visitedCount = 0
+        let maxDepth = 7
+        let maxVisitedCount = 500
+
+        while !queue.isEmpty, visitedCount < maxVisitedCount {
+            let (element, depth) = queue.removeFirst()
+            visitedCount += 1
+
+            if role(of: element) == (kAXWindowRole as String) {
+                windows.append(element)
+                continue
+            }
+
+            guard depth < maxDepth else {
+                continue
+            }
+
+            let childrenLookup = elementArray(
+                attribute: kAXChildrenAttribute as CFString,
+                of: element
+            )
+            queue.append(contentsOf: childrenLookup.elements.map { ($0, depth + 1) })
+        }
+
+        return AXChildrenWindowLookup(
+            windows: windows,
+            error: rootChildrenLookup.error,
+            valueDescription: rootChildrenLookup.valueDescription,
+            visitedCount: visitedCount
+        )
+    }
+
+    private static func role(of element: AXUIElement) -> String? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            element,
+            kAXRoleAttribute as CFString,
+            &value
+        )
+
+        guard error == .success else {
+            return nil
+        }
+
+        return value as? String
+    }
+
+    private static func describeAXValue(_ value: CFTypeRef?) -> String {
+        guard let value else {
+            return "nil"
+        }
+
+        if let array = value as? [Any] {
+            return "array count \(array.count)"
+        }
+
+        return String(describing: type(of: value))
+    }
+
+    private static func windows(in applicationElement: AXUIElement) -> [AXUIElement] {
+        windowsResult(in: applicationElement).windows
+    }
+
+    private static func accessibilityFocusedWindowTitle(for processIdentifier: pid_t) -> String? {
+        guard AXIsProcessTrusted() else {
+            return nil
+        }
+
+        let applicationElement = AXUIElementCreateApplication(processIdentifier)
+        return focusedWindow(in: applicationElement).flatMap { title(of: $0) }
+    }
+
+    private static func focusedWindow(in applicationElement: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+        let error = AXUIElementCopyAttributeValue(
+            applicationElement,
+            kAXFocusedWindowAttribute as CFString,
+            &value
+        )
+
+        guard error == .success else {
+            return nil
+        }
+
+        guard let value else {
+            return nil
+        }
+
+        return (value as! AXUIElement)
     }
 
     private static func title(of window: AXUIElement) -> String? {
@@ -1417,14 +2757,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cachedInstalledApps: [LaunchableApp] = []
     private var cachedApps: [LaunchableApp] = []
     private var lastScanDate = Date.distantPast
+    private var previousFrontmostProcessIdentifier: pid_t?
+    private var previousFrontmostWindowTitle: String?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        AppLog.start()
         NSApp.setActivationPolicy(.accessory)
         setupWindow()
         setupStatusItem()
         registerHotKey()
         refreshApplications(force: true)
         WindowPermissionManager.requestStartupPermissions()
+        AppLog.write("application_did_finish_launching", [
+            "cached_installed_apps": cachedInstalledApps.count,
+            "cached_apps": cachedApps.count
+        ])
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -1627,11 +2974,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func showWindowPermissionStatusFromMenu() {
         refreshApplications(force: true)
 
+        let permissionStatus = WindowPermissionManager.statusReport()
+        let activationStatus = WindowActivator.statusReport()
+        let candidateStatus = AppDiscovery.candidateStatusReport(candidates: cachedApps)
+        AppLog.write("status_report", [
+            "permission_status": permissionStatus,
+            "activation_status": activationStatus,
+            "candidate_status": candidateStatus
+        ])
+
         let alert = NSAlert()
         alert.messageText = "Window Permission Status"
         alert.informativeText = [
-            WindowPermissionManager.statusReport(),
-            AppDiscovery.candidateStatusReport(candidates: cachedApps)
+            permissionStatus,
+            activationStatus,
+            candidateStatus
         ].joined(separator: "\n\n")
         alert.alertStyle = .informational
         alert.addButton(withTitle: "OK")
@@ -1669,9 +3026,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func showLauncher() {
+        capturePreviousFrontmostWindow()
         refreshApplications(force: false)
         launcherViewController.prepareForPresentation(apps: cachedApps)
         positionWindow()
+        AppLog.write("show_launcher", [
+            "candidate_count": cachedApps.count,
+            "previous_pid": logPID(previousFrontmostProcessIdentifier),
+            "previous_title": previousFrontmostWindowTitle ?? "nil"
+        ])
 
         NSApp.activate(ignoringOtherApps: true)
         window?.makeKeyAndOrderFront(nil)
@@ -1683,6 +3046,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func hideLauncher() {
         window?.orderOut(nil)
+    }
+
+    private func capturePreviousFrontmostWindow() {
+        guard let frontmostApplication = NSWorkspace.shared.frontmostApplication else {
+            previousFrontmostProcessIdentifier = nil
+            previousFrontmostWindowTitle = nil
+            AppLog.write("capture_previous_frontmost_window", [
+                "result": "no_frontmost_application"
+            ])
+            return
+        }
+
+        let processIdentifier = frontmostApplication.processIdentifier
+        previousFrontmostProcessIdentifier = processIdentifier
+        previousFrontmostWindowTitle = WindowActivator.frontmostWindowTitle(for: processIdentifier)
+        AppLog.write("capture_previous_frontmost_window", [
+            "pid": Int(processIdentifier),
+            "localized_name": frontmostApplication.localizedName ?? "nil",
+            "bundle_id": frontmostApplication.bundleIdentifier ?? "nil",
+            "window_title": previousFrontmostWindowTitle ?? "nil"
+        ])
     }
 
     private func positionWindow() {
@@ -1714,13 +3098,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         cachedApps = AppDiscovery.includeRunningApplications(in: cachedInstalledApps)
+        AppLog.write("refresh_applications", [
+            "force": force,
+            "installed_candidates": cachedInstalledApps.count,
+            "all_candidates": cachedApps.count
+        ])
     }
 
     private func launch(_ app: LaunchableApp) {
         hideLauncher()
+        AppLog.write("launch_candidate", [
+            "name": app.name,
+            "application_name": (app.applicationName ?? "nil") as String,
+            "bundle_id": (app.bundleIdentifier ?? "nil") as String,
+            "pid": logPID(app.processIdentifier),
+            "is_running": app.isRunning,
+            "target_kind": app.targetKind == .window ? "window" : "application",
+            "window_title": (app.windowTitle ?? "nil") as String,
+            "window_identifier": logWindowIdentifier(app.windowIdentifier),
+            "window_frame": logFrame(app.windowFrame)
+        ])
 
-        if WindowActivator.activateWindow(for: app) {
+        if WindowActivator.activate(
+            app,
+            previousFrontmostProcessIdentifier: previousFrontmostProcessIdentifier,
+            previousFrontmostWindowTitle: previousFrontmostWindowTitle
+        ) {
             launchHistoryStore.recordLaunch(of: app)
+            return
+        }
+
+        if app.targetKind == .window {
+            NSSound.beep()
+            AppLog.write("launch_failed", [
+                "name": app.name,
+                "reason": "target_window_not_focusable"
+            ])
             return
         }
 
@@ -1731,6 +3144,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             runningApplication.unhide()
 
             if runningApplication.activate(options: [.activateAllWindows, .activateIgnoringOtherApps]) {
+                AppLog.write("running_app_fallback_activated", [
+                    "name": app.name,
+                    "pid": Int(processIdentifier)
+                ])
                 launchHistoryStore.recordLaunch(of: app)
                 return
             }
@@ -1739,6 +3156,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let url = app.url else {
             NSSound.beep()
             fputs("Failed to activate \(app.name): no application URL is available\n", stderr)
+            AppLog.write("launch_failed", [
+                "name": app.name,
+                "reason": "missing_url"
+            ])
             return
         }
 
@@ -1749,13 +3170,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let error {
                 NSSound.beep()
                 fputs("Failed to launch \(app.name): \(error.localizedDescription)\n", stderr)
+                AppLog.write("launch_failed", [
+                    "name": app.name,
+                    "reason": error.localizedDescription
+                ])
                 return
             }
 
             DispatchQueue.main.async { [weak self] in
                 self?.launchHistoryStore.recordLaunch(of: app)
+                AppLog.write("launch_completed", [
+                    "name": app.name,
+                    "url": url.path
+                ])
             }
         }
+    }
+
+    private func logFrame(_ frame: WindowFrame?) -> [String: Any] {
+        guard let frame else {
+            return [:]
+        }
+
+        return [
+            "x": frame.x,
+            "y": frame.y,
+            "width": frame.width,
+            "height": frame.height
+        ]
+    }
+
+    private func logPID(_ processIdentifier: pid_t?) -> Any {
+        processIdentifier.map { Int($0) } ?? NSNull()
+    }
+
+    private func logWindowIdentifier(_ windowIdentifier: UInt32?) -> Any {
+        windowIdentifier.map { Int($0) } ?? NSNull()
     }
 }
 
