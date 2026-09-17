@@ -5,6 +5,7 @@ import Darwin
 import ScreenCaptureKit
 
 enum AppLog {
+    #if DEBUG
     private static let queue = DispatchQueue(label: "TakoLauncher.AppLog")
     private static let dateFormatter: ISO8601DateFormatter = {
         let formatter = ISO8601DateFormatter()
@@ -48,12 +49,12 @@ enum AppLog {
         ])
     }
 
-    static func write(_ event: String, _ fields: [String: Any] = [:]) {
+    static func write(_ event: String, _ fields: @autoclosure () -> [String: Any] = [:]) {
         guard let fileURL else {
             return
         }
 
-        var payload = fields
+        var payload = fields()
         payload["event"] = event
         payload["timestamp"] = dateFormatter.string(from: Date())
 
@@ -97,6 +98,11 @@ enum AppLog {
             isDirectory: true
         ).appendingPathComponent("logs", isDirectory: true)
     }
+    #else
+    static func start() {}
+
+    static func write(_ event: String, _ fields: @autoclosure () -> [String: Any] = [:]) {}
+    #endif
 }
 
 enum LaunchTargetKind: Hashable {
@@ -987,12 +993,16 @@ enum WindowActivator {
     }
 
     static func statusReport() -> String {
+        #if DEBUG
         guard !lastActivationLines.isEmpty else {
             return "Last window activation: not attempted in this run"
         }
 
         return (["Last window activation:"] + lastActivationLines.map { "  \($0)" })
             .joined(separator: "\n")
+        #else
+        return "Last window activation: debug details available in debug builds"
+        #endif
     }
 
     static func frontmostWindowTitle(for processIdentifier: pid_t) -> String? {
@@ -1352,11 +1362,6 @@ enum WindowActivator {
         lines.append("perform AXRaise: \(describe(raiseError))")
 
         recordActivation(lines)
-    }
-
-    private static func findWindow(in applicationElement: AXUIElement, matching targetTitle: String?) -> AXUIElement? {
-        let windows = windows(in: applicationElement)
-        return findWindow(in: windows, matching: targetTitle, identifier: nil, frame: nil)
     }
 
     private static func findWindow(
@@ -2066,10 +2071,6 @@ enum WindowActivator {
         }
 
         return String(describing: type(of: value))
-    }
-
-    private static func windows(in applicationElement: AXUIElement) -> [AXUIElement] {
-        windowsResult(in: applicationElement).windows
     }
 
     private static func accessibilityFocusedWindowTitle(for processIdentifier: pid_t) -> String? {
