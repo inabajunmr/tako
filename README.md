@@ -1,6 +1,6 @@
 # Tendon
 
-Small macOS app for opening apps and windows quickly.
+Small macOS app for opening apps, windows, and bookmarks quickly.
 
 ## Run
 
@@ -20,7 +20,7 @@ open dist/Tendon.app
 ## Controls
 
 - `Option+N`: show or hide Tendon
-- Type to filter applications case-insensitively
+- Type to filter candidates case-insensitively
 - `Command+A`: select all text in the search field
 - `Up` / `Down`: move selection
 - `Control+N` / `Control+P`: move selection while typing
@@ -32,6 +32,8 @@ Applications are scanned from `/Applications`, `/System/Applications`, and `~/Ap
 Currently running regular apps are also included, even when they are outside those folders.
 Windows for running apps are included as separate candidates when macOS exposes a window title.
 Selecting a window focuses that window when Accessibility permission is granted.
+Google Chrome bookmarks are scanned from local Chrome profiles and are included as candidates once
+you start typing. Selecting a bookmark opens it with the default browser.
 On startup, Tendon checks its own Screen Recording and Accessibility status, then only
 requests the missing permissions.
 macOS may require Accessibility permission for window focusing and Screen Recording permission for

@@ -3,6 +3,7 @@ import ApplicationServices
 import Carbon
 import Darwin
 import ScreenCaptureKit
+import UniformTypeIdentifiers
 
 enum AppLog {
     #if DEBUG
@@ -108,6 +109,18 @@ enum AppLog {
 enum LaunchTargetKind: Hashable {
     case application
     case window
+    case bookmark
+
+    var logValue: String {
+        switch self {
+        case .application:
+            return "application"
+        case .window:
+            return "window"
+        case .bookmark:
+            return "bookmark"
+        }
+    }
 }
 
 struct WindowFrame: Hashable {
@@ -140,11 +153,22 @@ struct LaunchableApp: Hashable {
         case .window:
             let owner = applicationName ?? bundleIdentifier ?? processIdentifier.map { "pid \($0)" } ?? "Unknown app"
             return "Window - \(owner)"
+        case .bookmark:
+            let detail = url?.absoluteString ?? "Unknown URL"
+            if let applicationName, !applicationName.isEmpty {
+                return "Bookmark - \(applicationName) - \(detail)"
+            }
+
+            return "Bookmark - \(detail)"
         }
     }
 
     var resolvedPath: String? {
-        url?.resolvingSymlinksInPath().path
+        guard url?.isFileURL == true else {
+            return nil
+        }
+
+        return url?.resolvingSymlinksInPath().path
     }
 
     func matches(_ query: String) -> Bool {
@@ -153,7 +177,7 @@ struct LaunchableApp: Hashable {
             .filter { !$0.isEmpty }
 
         guard !tokens.isEmpty else {
-            return true
+            return targetKind != .bookmark
         }
 
         return tokens.allSatisfy { token in
@@ -832,6 +856,183 @@ enum AppDiscovery {
     }
 }
 
+private enum ChromeBookmarkDiscovery {
+    private struct BookmarkFile: Decodable {
+        let roots: [String: BookmarkNode]
+    }
+
+    private struct BookmarkNode: Decodable {
+        let type: String?
+        let name: String?
+        let url: String?
+        let children: [BookmarkNode]?
+    }
+
+    static func loadBookmarks(fileManager: FileManager = .default) -> [LaunchableApp] {
+        var seenURLs = Set<String>()
+        var bookmarks: [LaunchableApp] = []
+
+        for bookmarksFileURL in bookmarkFileURLs(fileManager: fileManager) {
+            guard
+                let data = try? Data(contentsOf: bookmarksFileURL),
+                let bookmarkFile = try? JSONDecoder().decode(BookmarkFile.self, from: data)
+            else {
+                continue
+            }
+
+            let profileName = bookmarksFileURL.deletingLastPathComponent().lastPathComponent
+
+            for root in bookmarkFile.roots.values {
+                appendBookmarks(
+                    from: root,
+                    folderPath: [],
+                    profileName: profileName,
+                    seenURLs: &seenURLs,
+                    bookmarks: &bookmarks
+                )
+            }
+        }
+
+        return bookmarks.sorted {
+            $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    private static func bookmarkFileURLs(fileManager: FileManager) -> [URL] {
+        let chromeDirectoryURL = fileManager.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/Google/Chrome", isDirectory: true)
+
+        var fileURLs: [URL] = []
+
+        let topLevelBookmarksURL = chromeDirectoryURL.appendingPathComponent("Bookmarks")
+        if fileManager.fileExists(atPath: topLevelBookmarksURL.path) {
+            fileURLs.append(topLevelBookmarksURL)
+        }
+
+        guard
+            let profileDirectoryURLs = try? fileManager.contentsOfDirectory(
+                at: chromeDirectoryURL,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        else {
+            return fileURLs
+        }
+
+        for profileDirectoryURL in profileDirectoryURLs {
+            guard
+                (try? profileDirectoryURL.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true
+            else {
+                continue
+            }
+
+            let bookmarksURL = profileDirectoryURL.appendingPathComponent("Bookmarks")
+            if fileManager.fileExists(atPath: bookmarksURL.path) {
+                fileURLs.append(bookmarksURL)
+            }
+        }
+
+        return fileURLs.sorted {
+            $0.path.localizedStandardCompare($1.path) == .orderedAscending
+        }
+    }
+
+    private static func appendBookmarks(
+        from node: BookmarkNode,
+        folderPath: [String],
+        profileName: String,
+        seenURLs: inout Set<String>,
+        bookmarks: inout [LaunchableApp]
+    ) {
+        switch node.type {
+        case "url":
+            guard
+                let urlString = trimmed(node.url),
+                let url = URL(string: urlString),
+                isWebURL(url)
+            else {
+                return
+            }
+
+            let normalizedURL = url.absoluteString
+            guard !seenURLs.contains(normalizedURL) else {
+                return
+            }
+
+            seenURLs.insert(normalizedURL)
+
+            let title = trimmed(node.name) ?? url.host ?? normalizedURL
+            let folderDescription = bookmarkFolderDescription(profileName: profileName, folderPath: folderPath)
+            let historyKey = "bookmark:\(normalizedURL)"
+            let searchText = [
+                title,
+                normalizedURL,
+                url.host,
+                folderDescription,
+                "bookmark"
+            ]
+                .compactMap { $0 }
+                .joined(separator: " ")
+
+            bookmarks.append(LaunchableApp(
+                name: title,
+                applicationName: folderDescription,
+                url: url,
+                bundleIdentifier: nil,
+                searchText: searchText,
+                identityKey: historyKey,
+                historyKey: historyKey,
+                processIdentifier: nil,
+                isRunning: false,
+                targetKind: .bookmark,
+                windowTitle: nil,
+                windowFrame: nil,
+                windowIdentifier: nil
+            ))
+        default:
+            let nextFolderPath: [String]
+            if let folderName = trimmed(node.name) {
+                nextFolderPath = folderPath + [folderName]
+            } else {
+                nextFolderPath = folderPath
+            }
+
+            for child in node.children ?? [] {
+                appendBookmarks(
+                    from: child,
+                    folderPath: nextFolderPath,
+                    profileName: profileName,
+                    seenURLs: &seenURLs,
+                    bookmarks: &bookmarks
+                )
+            }
+        }
+    }
+
+    private static func bookmarkFolderDescription(profileName: String, folderPath: [String]) -> String {
+        ([profileName] + folderPath)
+            .filter { !$0.isEmpty }
+            .joined(separator: " / ")
+    }
+
+    private static func isWebURL(_ url: URL) -> Bool {
+        guard let scheme = url.scheme?.lowercased() else {
+            return false
+        }
+
+        return scheme == "http" || scheme == "https"
+    }
+
+    private static func trimmed(_ string: String?) -> String? {
+        guard let string else {
+            return nil
+        }
+
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+}
+
 private struct LaunchHistoryEntry: Codable {
     var count: Int
     var lastLaunchedAt: Date
@@ -1009,6 +1210,8 @@ enum WindowActivator {
             )
         case .window:
             return activateWindow(for: app)
+        case .bookmark:
+            return false
         }
     }
 
@@ -2548,7 +2751,9 @@ final class AppCellView: NSTableCellView {
     }
 
     func configure(with app: LaunchableApp) {
-        if let url = app.url {
+        if app.targetKind == .bookmark {
+            appIconView.image = NSWorkspace.shared.icon(for: .url)
+        } else if let url = app.url {
             appIconView.image = NSWorkspace.shared.icon(forFile: url.path)
         } else if
             let processIdentifier = app.processIdentifier,
@@ -2610,7 +2815,7 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
     private let searchField = LauncherSearchField()
     private let scrollView = NSScrollView()
     private let tableView = LauncherTableView()
-    private let emptyLabel = NSTextField(labelWithString: "No matching applications")
+    private let emptyLabel = NSTextField(labelWithString: "No matching items")
 
     private var apps: [LaunchableApp] = []
     private var filteredApps: [LaunchableApp] = []
@@ -2662,7 +2867,7 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
 
     private func setupSearchField() {
         searchField.translatesAutoresizingMaskIntoConstraints = false
-        searchField.placeholderString = "Search applications"
+        searchField.placeholderString = "Search"
         searchField.font = .systemFont(ofSize: 18)
         searchField.delegate = self
         searchField.focusRingType = .none
@@ -2843,6 +3048,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
     private var cachedInstalledApps: [LaunchableApp] = []
+    private var cachedBookmarks: [LaunchableApp] = []
     private var cachedApps: [LaunchableApp] = []
     private var lastScanDate = Date.distantPast
     private var previousFrontmostProcessIdentifier: pid_t?
@@ -2858,6 +3064,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WindowPermissionManager.requestStartupPermissions()
         AppLog.write("application_did_finish_launching", [
             "cached_installed_apps": cachedInstalledApps.count,
+            "cached_bookmarks": cachedBookmarks.count,
             "cached_apps": cachedApps.count
         ])
     }
@@ -3079,13 +3286,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshApplications(force: Bool) {
         if force || cachedInstalledApps.isEmpty || Date().timeIntervalSince(lastScanDate) > 30 {
             cachedInstalledApps = AppDiscovery.loadInstalledApplications()
+            cachedBookmarks = ChromeBookmarkDiscovery.loadBookmarks()
             lastScanDate = Date()
         }
 
-        cachedApps = AppDiscovery.includeRunningApplications(in: cachedInstalledApps)
+        cachedApps = AppDiscovery.includeRunningApplications(in: cachedInstalledApps) + cachedBookmarks
         AppLog.write("refresh_applications", [
             "force": force,
             "installed_candidates": cachedInstalledApps.count,
+            "bookmark_candidates": cachedBookmarks.count,
             "all_candidates": cachedApps.count
         ])
     }
@@ -3098,11 +3307,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "bundle_id": (app.bundleIdentifier ?? "nil") as String,
             "pid": logPID(app.processIdentifier),
             "is_running": app.isRunning,
-            "target_kind": app.targetKind == .window ? "window" : "application",
+            "target_kind": app.targetKind.logValue,
             "window_title": (app.windowTitle ?? "nil") as String,
             "window_identifier": logWindowIdentifier(app.windowIdentifier),
             "window_frame": logFrame(app.windowFrame)
         ])
+
+        if app.targetKind == .bookmark {
+            guard let url = app.url else {
+                NSSound.beep()
+                AppLog.write("launch_failed", [
+                    "name": app.name,
+                    "reason": "missing_bookmark_url"
+                ])
+                return
+            }
+
+            if NSWorkspace.shared.open(url) {
+                launchHistoryStore.recordLaunch(of: app)
+                AppLog.write("launch_completed", [
+                    "name": app.name,
+                    "url": url.absoluteString
+                ])
+            } else {
+                NSSound.beep()
+                AppLog.write("launch_failed", [
+                    "name": app.name,
+                    "reason": "failed_to_open_bookmark_url"
+                ])
+            }
+
+            return
+        }
 
         if WindowActivator.activate(
             app,
