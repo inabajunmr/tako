@@ -976,6 +976,11 @@ enum WindowActivator {
         let visibleTitles: [String]
     }
 
+    private struct WindowMenuSelectionObservation {
+        let frontmostProcessIdentifier: pid_t?
+        let title: String?
+    }
+
     private enum WindowMenuFallbackActivationMode {
         case direct
         case activateFirst
@@ -1565,7 +1570,13 @@ enum WindowActivator {
 
             let activated = runningApplication.activate(options: [.activateIgnoringOtherApps])
             lines.append("Window menu fallback activated activate app: \(activated ? "true" : "false")")
-            Thread.sleep(forTimeInterval: 0.18)
+            let observedFrontmostProcessIdentifier = waitForFrontmostProcessIdentifier(
+                runningApplication.processIdentifier,
+                timeout: 0.12
+            )
+            lines.append(
+                "Window menu fallback activated frontmost after activate: \(formatPID(observedFrontmostProcessIdentifier))"
+            )
         }
 
         let menuBarLookup = elementAttribute(
@@ -1622,9 +1633,12 @@ enum WindowActivator {
 
             let openError = AXUIElementPerformAction(windowMenuItem, kAXPressAction as CFString)
             lines.append("Window menu fallback activated open \(windowMenuTitle): \(describe(openError))")
-            Thread.sleep(forTimeInterval: 0.12)
 
-            let openedSearch = menuItem(in: windowMenuItem, matching: targetTitle)
+            let openedSearch = waitForMenuItem(
+                in: windowMenuItem,
+                matching: targetTitle,
+                timeout: 0.12
+            )
             lines.append(
                 "Window menu fallback activated opened search in \(windowMenuTitle): visited \(openedSearch.visitedCount), titles \(formatTitles(openedSearch.visibleTitles))"
             )
@@ -1662,27 +1676,33 @@ enum WindowActivator {
             return false
         }
 
-        Thread.sleep(forTimeInterval: 0.45)
-        var observedFrontmostProcessIdentifier = frontmostProcessIdentifier()
-        var observedTitle = frontmostWindowTitle(for: runningApplication.processIdentifier)
+        var observation = waitForWindowMenuSelection(
+            targetTitle: targetTitle,
+            processIdentifier: runningApplication.processIdentifier,
+            requireFrontmost: false,
+            timeout: 0.08
+        )
         lines.append(
-            "Window menu fallback observed after press: frontmost pid \(formatPID(observedFrontmostProcessIdentifier)), title \(observedTitle ?? "nil")"
+            "Window menu fallback observed after press: frontmost pid \(formatPID(observation.frontmostProcessIdentifier)), title \(observation.title ?? "nil")"
         )
 
-        if observedFrontmostProcessIdentifier != runningApplication.processIdentifier {
+        if observation.frontmostProcessIdentifier != runningApplication.processIdentifier {
             let activated = runningApplication.activate(options: [.activateIgnoringOtherApps])
             lines.append("Window menu fallback activate after press: \(activated ? "true" : "false")")
-            Thread.sleep(forTimeInterval: 0.18)
-            observedFrontmostProcessIdentifier = frontmostProcessIdentifier()
-            observedTitle = frontmostWindowTitle(for: runningApplication.processIdentifier)
+            observation = waitForWindowMenuSelection(
+                targetTitle: targetTitle,
+                processIdentifier: runningApplication.processIdentifier,
+                requireFrontmost: true,
+                timeout: 0.18
+            )
             lines.append(
-                "Window menu fallback observed after activate: frontmost pid \(formatPID(observedFrontmostProcessIdentifier)), title \(observedTitle ?? "nil")"
+                "Window menu fallback observed after activate: frontmost pid \(formatPID(observation.frontmostProcessIdentifier)), title \(observation.title ?? "nil")"
             )
         }
 
         guard
-            observedFrontmostProcessIdentifier == runningApplication.processIdentifier,
-            let observedTitle,
+            observation.frontmostProcessIdentifier == runningApplication.processIdentifier,
+            let observedTitle = observation.title,
             menuItemTitleMatches(observedTitle, targetTitle)
         else {
             lines.append("Window menu fallback result: press succeeded but target app/title not observed")
@@ -1736,6 +1756,87 @@ enum WindowActivator {
             visitedCount: visitedCount,
             visibleTitles: visibleTitles
         )
+    }
+
+    private static func waitForMenuItem(
+        in root: AXUIElement,
+        matching targetTitle: String,
+        timeout: TimeInterval
+    ) -> AXMenuItemSearchResult {
+        let deadline = Date().addingTimeInterval(timeout)
+        var latestResult = menuItem(in: root, matching: targetTitle)
+
+        while latestResult.item == nil, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+            latestResult = menuItem(in: root, matching: targetTitle)
+        }
+
+        return latestResult
+    }
+
+    private static func waitForWindowMenuSelection(
+        targetTitle: String,
+        processIdentifier: pid_t,
+        requireFrontmost: Bool,
+        timeout: TimeInterval
+    ) -> WindowMenuSelectionObservation {
+        let deadline = Date().addingTimeInterval(timeout)
+        var latestObservation = observeWindowMenuSelection(for: processIdentifier)
+
+        while Date() < deadline {
+            if windowMenuSelectionMatches(
+                latestObservation,
+                targetTitle: targetTitle,
+                processIdentifier: processIdentifier,
+                requireFrontmost: requireFrontmost
+            ) {
+                break
+            }
+
+            Thread.sleep(forTimeInterval: 0.01)
+            latestObservation = observeWindowMenuSelection(for: processIdentifier)
+        }
+
+        return latestObservation
+    }
+
+    private static func waitForFrontmostProcessIdentifier(
+        _ processIdentifier: pid_t,
+        timeout: TimeInterval
+    ) -> pid_t? {
+        let deadline = Date().addingTimeInterval(timeout)
+        var latestProcessIdentifier = frontmostProcessIdentifier()
+
+        while latestProcessIdentifier != processIdentifier, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+            latestProcessIdentifier = frontmostProcessIdentifier()
+        }
+
+        return latestProcessIdentifier
+    }
+
+    private static func observeWindowMenuSelection(for processIdentifier: pid_t) -> WindowMenuSelectionObservation {
+        WindowMenuSelectionObservation(
+            frontmostProcessIdentifier: frontmostProcessIdentifier(),
+            title: frontmostWindowTitle(for: processIdentifier)
+        )
+    }
+
+    private static func windowMenuSelectionMatches(
+        _ observation: WindowMenuSelectionObservation,
+        targetTitle: String,
+        processIdentifier: pid_t,
+        requireFrontmost: Bool
+    ) -> Bool {
+        if requireFrontmost, observation.frontmostProcessIdentifier != processIdentifier {
+            return false
+        }
+
+        guard let observedTitle = observation.title else {
+            return false
+        }
+
+        return menuItemTitleMatches(observedTitle, targetTitle)
     }
 
     private static func hitTestPoints(in frame: WindowFrame) -> [CGPoint] {
@@ -1987,15 +2088,25 @@ enum WindowActivator {
                 "AXManualAccessibility" as CFString,
                 kCFBooleanTrue
             )
-            Thread.sleep(forTimeInterval: 0.12)
         } else {
             manualAccessibilityError = nil
         }
 
-        let directLookup = elementArray(
+        var directLookup = elementArray(
             attribute: kAXWindowsAttribute as CFString,
             of: applicationElement
         )
+
+        if
+            directLookup.elements.isEmpty,
+            directLookup.error == .success,
+            manualAccessibilityError == .success {
+            directLookup = waitForNonEmptyElementArray(
+                attribute: kAXWindowsAttribute as CFString,
+                of: applicationElement,
+                timeout: 0.06
+            )
+        }
 
         if !directLookup.elements.isEmpty {
             return AXWindowsLookup(
@@ -2034,6 +2145,22 @@ enum WindowActivator {
             childrenValueDescription: childrenLookup.valueDescription,
             childrenVisitedCount: childrenLookup.visitedCount
         )
+    }
+
+    private static func waitForNonEmptyElementArray(
+        attribute: CFString,
+        of element: AXUIElement,
+        timeout: TimeInterval
+    ) -> AXElementArrayLookup {
+        let deadline = Date().addingTimeInterval(timeout)
+        var latestLookup = elementArray(attribute: attribute, of: element)
+
+        while latestLookup.elements.isEmpty, latestLookup.error == .success, Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.01)
+            latestLookup = elementArray(attribute: attribute, of: element)
+        }
+
+        return latestLookup
     }
 
     private static func elementArray(attribute: CFString, of element: AXUIElement) -> AXElementArrayLookup {
