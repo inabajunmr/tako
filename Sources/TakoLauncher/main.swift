@@ -976,6 +976,20 @@ enum WindowActivator {
         let visibleTitles: [String]
     }
 
+    private enum WindowMenuFallbackActivationMode {
+        case direct
+        case activateFirst
+
+        var logLabel: String {
+            switch self {
+            case .direct:
+                return "direct"
+            case .activateFirst:
+                return "activated"
+            }
+        }
+    }
+
     static func activate(
         _ app: LaunchableApp,
         previousFrontmostProcessIdentifier: pid_t?,
@@ -1336,6 +1350,9 @@ enum WindowActivator {
         )
         lines.append("set app AXFocusedWindow: \(describe(focusedWindowError))")
 
+        let preActivationRaiseError = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+        lines.append("perform AXRaise before app activation: \(describe(preActivationRaiseError))")
+
         let frontmostError = AXUIElementSetAttributeValue(
             applicationElement,
             kAXFrontmostAttribute as CFString,
@@ -1346,8 +1363,8 @@ enum WindowActivator {
         let activated = runningApplication.activate(options: [.activateIgnoringOtherApps])
         lines.append("NSRunningApplication.activate: \(activated ? "true" : "false")")
 
-        let raiseError = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
-        lines.append("perform AXRaise: \(describe(raiseError))")
+        let postActivationRaiseError = AXUIElementPerformAction(targetWindow, kAXRaiseAction as CFString)
+        lines.append("perform AXRaise after app activation: \(describe(postActivationRaiseError))")
 
         recordActivation(lines)
     }
@@ -1508,27 +1525,59 @@ enum WindowActivator {
             return false
         }
 
-        let frontmostError = AXUIElementSetAttributeValue(
-            applicationElement,
-            kAXFrontmostAttribute as CFString,
-            kCFBooleanTrue
-        )
-        lines.append("Window menu fallback set app AXFrontmost=true: \(describe(frontmostError))")
+        if pressWindowMenuItemAttempt(
+            targetTitle: targetTitle,
+            in: applicationElement,
+            runningApplication: runningApplication,
+            activationMode: .direct,
+            lines: &lines
+        ) {
+            return true
+        }
 
-        let activated = runningApplication.activate(options: [.activateIgnoringOtherApps])
-        lines.append("Window menu fallback activate app: \(activated ? "true" : "false")")
-        Thread.sleep(forTimeInterval: 0.18)
+        lines.append("Window menu fallback: direct attempt failed, retrying after app activation")
+        return pressWindowMenuItemAttempt(
+            targetTitle: targetTitle,
+            in: applicationElement,
+            runningApplication: runningApplication,
+            activationMode: .activateFirst,
+            lines: &lines
+        )
+    }
+
+    private static func pressWindowMenuItemAttempt(
+        targetTitle: String,
+        in applicationElement: AXUIElement,
+        runningApplication: NSRunningApplication,
+        activationMode: WindowMenuFallbackActivationMode,
+        lines: inout [String]
+    ) -> Bool {
+        switch activationMode {
+        case .direct:
+            lines.append("Window menu fallback direct: skipped explicit app activation")
+        case .activateFirst:
+            let frontmostError = AXUIElementSetAttributeValue(
+                applicationElement,
+                kAXFrontmostAttribute as CFString,
+                kCFBooleanTrue
+            )
+            lines.append("Window menu fallback activated set app AXFrontmost=true: \(describe(frontmostError))")
+
+            let activated = runningApplication.activate(options: [.activateIgnoringOtherApps])
+            lines.append("Window menu fallback activated activate app: \(activated ? "true" : "false")")
+            Thread.sleep(forTimeInterval: 0.18)
+        }
 
         let menuBarLookup = elementAttribute(
             kAXMenuBarAttribute as CFString,
             of: applicationElement
         )
         lines.append(
-            "Window menu fallback menu bar: \(describe(menuBarLookup.error)) \(menuBarLookup.valueDescription)"
+            "Window menu fallback \(activationMode.logLabel) menu bar: \(describe(menuBarLookup.error)) \(menuBarLookup.valueDescription)"
         )
 
         guard let menuBar = menuBarLookup.element else {
-            lines.append("Window menu fallback result: no menu bar")
+            lines.append("Window menu fallback \(activationMode.logLabel) result: no menu bar")
             return false
         }
 
@@ -1538,14 +1587,14 @@ enum WindowActivator {
         )
         let menuBarItems = menuBarItemsLookup.elements
         let menuBarTitles = menuBarItems.compactMap { title(of: $0) }
-        lines.append("Window menu fallback menu bar items: \(formatTitles(menuBarTitles))")
+        lines.append("Window menu fallback \(activationMode.logLabel) menu bar items: \(formatTitles(menuBarTitles))")
 
         let windowMenuItems = menuBarItems.filter {
             title(of: $0).map(isWindowMenuTitle) == true
         }
 
         guard !windowMenuItems.isEmpty else {
-            lines.append("Window menu fallback result: Window menu not found")
+            lines.append("Window menu fallback \(activationMode.logLabel) result: Window menu not found")
             return false
         }
 
@@ -1553,40 +1602,45 @@ enum WindowActivator {
             let windowMenuTitle = title(of: windowMenuItem) ?? "(untitled)"
             let initialSearch = menuItem(in: windowMenuItem, matching: targetTitle)
             lines.append(
-                "Window menu fallback initial search in \(windowMenuTitle): visited \(initialSearch.visitedCount), titles \(formatTitles(initialSearch.visibleTitles))"
+                "Window menu fallback \(activationMode.logLabel) initial search in \(windowMenuTitle): visited \(initialSearch.visitedCount), titles \(formatTitles(initialSearch.visibleTitles))"
             )
 
             if let item = initialSearch.item {
                 return pressMenuItem(
                     item,
                     targetTitle: targetTitle,
-                    source: "initial",
+                    source: "\(activationMode.logLabel) initial",
                     runningApplication: runningApplication,
                     lines: &lines
                 )
             }
 
+            guard activationMode == .activateFirst else {
+                lines.append("Window menu fallback direct: target not visible without opening menu")
+                continue
+            }
+
             let openError = AXUIElementPerformAction(windowMenuItem, kAXPressAction as CFString)
-            lines.append("Window menu fallback open \(windowMenuTitle): \(describe(openError))")
+            lines.append("Window menu fallback activated open \(windowMenuTitle): \(describe(openError))")
             Thread.sleep(forTimeInterval: 0.12)
 
             let openedSearch = menuItem(in: windowMenuItem, matching: targetTitle)
             lines.append(
-                "Window menu fallback opened search in \(windowMenuTitle): visited \(openedSearch.visitedCount), titles \(formatTitles(openedSearch.visibleTitles))"
+                "Window menu fallback activated opened search in \(windowMenuTitle): visited \(openedSearch.visitedCount), titles \(formatTitles(openedSearch.visibleTitles))"
             )
 
             if let item = openedSearch.item {
                 return pressMenuItem(
                     item,
                     targetTitle: targetTitle,
-                    source: "opened",
+                    source: "activated opened",
                     runningApplication: runningApplication,
                     lines: &lines
                 )
             }
         }
 
-        lines.append("Window menu fallback result: no matching menu item")
+        lines.append("Window menu fallback \(activationMode.logLabel) result: no matching menu item")
         return false
     }
 
@@ -1609,14 +1663,29 @@ enum WindowActivator {
         }
 
         Thread.sleep(forTimeInterval: 0.45)
-        let observedTitle = frontmostWindowTitle(for: runningApplication.processIdentifier)
-        lines.append("Window menu fallback observed title after press: \(observedTitle ?? "nil")")
+        var observedFrontmostProcessIdentifier = frontmostProcessIdentifier()
+        var observedTitle = frontmostWindowTitle(for: runningApplication.processIdentifier)
+        lines.append(
+            "Window menu fallback observed after press: frontmost pid \(formatPID(observedFrontmostProcessIdentifier)), title \(observedTitle ?? "nil")"
+        )
+
+        if observedFrontmostProcessIdentifier != runningApplication.processIdentifier {
+            let activated = runningApplication.activate(options: [.activateIgnoringOtherApps])
+            lines.append("Window menu fallback activate after press: \(activated ? "true" : "false")")
+            Thread.sleep(forTimeInterval: 0.18)
+            observedFrontmostProcessIdentifier = frontmostProcessIdentifier()
+            observedTitle = frontmostWindowTitle(for: runningApplication.processIdentifier)
+            lines.append(
+                "Window menu fallback observed after activate: frontmost pid \(formatPID(observedFrontmostProcessIdentifier)), title \(observedTitle ?? "nil")"
+            )
+        }
 
         guard
+            observedFrontmostProcessIdentifier == runningApplication.processIdentifier,
             let observedTitle,
             menuItemTitleMatches(observedTitle, targetTitle)
         else {
-            lines.append("Window menu fallback result: press succeeded but target title not observed")
+            lines.append("Window menu fallback result: press succeeded but target app/title not observed")
             return false
         }
 
@@ -1894,6 +1963,10 @@ enum WindowActivator {
         }
 
         return processIdentifier
+    }
+
+    private static func frontmostProcessIdentifier() -> pid_t? {
+        NSWorkspace.shared.frontmostApplication?.processIdentifier
     }
 
     private static func recordActivation(_ lines: [String]) {
