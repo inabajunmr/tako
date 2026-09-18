@@ -9,6 +9,7 @@ swift run Tendon
 ```
 
 The app lives in the menu bar as `Tendon`. Press `Option+N` to show or hide it.
+Open `Preferences...` from the menu bar item to choose whether Chrome bookmarks are included.
 
 ## Package as an app bundle
 
@@ -33,7 +34,7 @@ Currently running regular apps are also included, even when they are outside tho
 Windows for running apps are included as separate candidates when macOS exposes a window title.
 Selecting a window focuses that window when Accessibility permission is granted.
 Google Chrome bookmarks are scanned from local Chrome profiles and are included as candidates once
-you start typing. Selecting a bookmark opens it with the default browser.
+you start typing when that source is enabled. Selecting a bookmark opens it with the default browser.
 On startup, Tendon checks its own Screen Recording and Accessibility status, then only
 requests the missing permissions.
 macOS may require Accessibility permission for window focusing and Screen Recording permission for

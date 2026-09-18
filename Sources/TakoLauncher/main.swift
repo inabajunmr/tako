@@ -106,6 +106,23 @@ enum AppLog {
     #endif
 }
 
+private enum AppPreferences {
+    private static let includeChromeBookmarksKey = "includeChromeBookmarks"
+
+    static var includeChromeBookmarks: Bool {
+        get {
+            guard UserDefaults.standard.object(forKey: includeChromeBookmarksKey) != nil else {
+                return true
+            }
+
+            return UserDefaults.standard.bool(forKey: includeChromeBookmarksKey)
+        }
+        set {
+            UserDefaults.standard.set(newValue, forKey: includeChromeBookmarksKey)
+        }
+    }
+}
+
 enum LaunchTargetKind: Hashable {
     case application
     case window
@@ -2806,6 +2823,100 @@ final class AppCellView: NSTableCellView {
     }
 }
 
+final class PreferencesViewController: NSViewController {
+    var onIncludeChromeBookmarksChanged: ((Bool) -> Void)?
+
+    private let includeChromeBookmarksButton = NSButton(
+        checkboxWithTitle: "Chrome bookmarks",
+        target: nil,
+        action: nil
+    )
+
+    init(includeChromeBookmarks: Bool) {
+        super.init(nibName: nil, bundle: nil)
+        includeChromeBookmarksButton.state = includeChromeBookmarks ? .on : .off
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    override func loadView() {
+        view = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 120))
+    }
+
+    override func viewDidLoad() {
+        super.viewDidLoad()
+        setup()
+    }
+
+    func setIncludeChromeBookmarks(_ includeChromeBookmarks: Bool) {
+        includeChromeBookmarksButton.state = includeChromeBookmarks ? .on : .off
+    }
+
+    private func setup() {
+        let titleLabel = NSTextField(labelWithString: "Sources")
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+        titleLabel.font = .systemFont(ofSize: 13, weight: .semibold)
+
+        includeChromeBookmarksButton.translatesAutoresizingMaskIntoConstraints = false
+        includeChromeBookmarksButton.target = self
+        includeChromeBookmarksButton.action = #selector(toggleIncludeChromeBookmarks(_:))
+
+        view.addSubview(titleLabel)
+        view.addSubview(includeChromeBookmarksButton)
+
+        NSLayoutConstraint.activate([
+            titleLabel.leadingAnchor.constraint(equalTo: view.leadingAnchor, constant: 22),
+            titleLabel.trailingAnchor.constraint(equalTo: view.trailingAnchor, constant: -22),
+            titleLabel.topAnchor.constraint(equalTo: view.topAnchor, constant: 20),
+
+            includeChromeBookmarksButton.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            includeChromeBookmarksButton.trailingAnchor.constraint(lessThanOrEqualTo: titleLabel.trailingAnchor),
+            includeChromeBookmarksButton.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 14)
+        ])
+    }
+
+    @objc private func toggleIncludeChromeBookmarks(_ sender: NSButton) {
+        onIncludeChromeBookmarksChanged?(sender.state == .on)
+    }
+}
+
+final class PreferencesWindowController: NSWindowController {
+    private let preferencesViewController: PreferencesViewController
+
+    init(
+        includeChromeBookmarks: Bool,
+        onIncludeChromeBookmarksChanged: @escaping (Bool) -> Void
+    ) {
+        self.preferencesViewController = PreferencesViewController(
+            includeChromeBookmarks: includeChromeBookmarks
+        )
+
+        let window = NSWindow(
+            contentRect: NSRect(x: 0, y: 0, width: 320, height: 120),
+            styleMask: [.titled, .closable],
+            backing: .buffered,
+            defer: false
+        )
+        window.title = "Preferences"
+        window.contentViewController = preferencesViewController
+        window.isReleasedWhenClosed = false
+        window.center()
+
+        super.init(window: window)
+        preferencesViewController.onIncludeChromeBookmarksChanged = onIncludeChromeBookmarksChanged
+    }
+
+    required init?(coder: NSCoder) {
+        nil
+    }
+
+    func syncFromPreferences() {
+        preferencesViewController.setIncludeChromeBookmarks(AppPreferences.includeChromeBookmarks)
+    }
+}
+
 final class LauncherViewController: NSViewController, NSTableViewDataSource, NSTableViewDelegate, NSSearchFieldDelegate {
     var onLaunch: ((LaunchableApp) -> Void)?
     var onClose: (() -> Void)?
@@ -2839,6 +2950,11 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
     func prepareForPresentation(apps: [LaunchableApp]) {
         self.apps = apps
         searchField.stringValue = ""
+        applyFilter()
+    }
+
+    func updateApps(_ apps: [LaunchableApp]) {
+        self.apps = apps
         applyFilter()
     }
 
@@ -3044,6 +3160,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private let launcherViewController = LauncherViewController()
     private let launchHistoryStore = LaunchHistoryStore()
     private var window: LauncherPanel?
+    private var preferencesWindowController: PreferencesWindowController?
     private var statusItem: NSStatusItem?
     private var hotKeyRef: EventHotKeyRef?
     private var eventHandlerRef: EventHandlerRef?
@@ -3122,11 +3239,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         item.button?.toolTip = "Tendon"
 
         let menu = NSMenu()
-        menu.addItem(NSMenuItem(
+        let preferencesItem = NSMenuItem(
+            title: "Preferences...",
+            action: #selector(showPreferencesFromMenu),
+            keyEquivalent: ","
+        )
+        preferencesItem.target = self
+        menu.addItem(preferencesItem)
+        menu.addItem(.separator())
+        let quitItem = NSMenuItem(
             title: "Quit",
             action: #selector(quitFromMenu),
             keyEquivalent: "q"
-        ))
+        )
+        quitItem.target = self
+        menu.addItem(quitItem)
         item.menu = menu
         statusItem = item
     }
@@ -3203,6 +3330,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func quitFromMenu() {
         NSApp.terminate(nil)
+    }
+
+    @objc private func showPreferencesFromMenu() {
+        if preferencesWindowController == nil {
+            preferencesWindowController = PreferencesWindowController(
+                includeChromeBookmarks: AppPreferences.includeChromeBookmarks,
+                onIncludeChromeBookmarksChanged: { [weak self] includeChromeBookmarks in
+                    AppPreferences.includeChromeBookmarks = includeChromeBookmarks
+                    self?.refreshApplications(force: true)
+                    self?.refreshVisibleLauncherCandidates()
+                    AppLog.write("preferences_changed", [
+                        "include_chrome_bookmarks": includeChromeBookmarks
+                    ])
+                }
+            )
+        }
+
+        preferencesWindowController?.syncFromPreferences()
+        NSApp.activate(ignoringOtherApps: true)
+        preferencesWindowController?.showWindow(nil)
+        preferencesWindowController?.window?.makeKeyAndOrderFront(nil)
     }
 
     private func toggleLauncher() {
@@ -3286,17 +3434,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func refreshApplications(force: Bool) {
         if force || cachedInstalledApps.isEmpty || Date().timeIntervalSince(lastScanDate) > 30 {
             cachedInstalledApps = AppDiscovery.loadInstalledApplications()
-            cachedBookmarks = ChromeBookmarkDiscovery.loadBookmarks()
+            cachedBookmarks = AppPreferences.includeChromeBookmarks ?
+                ChromeBookmarkDiscovery.loadBookmarks() :
+                []
             lastScanDate = Date()
         }
 
         cachedApps = AppDiscovery.includeRunningApplications(in: cachedInstalledApps) + cachedBookmarks
         AppLog.write("refresh_applications", [
             "force": force,
+            "include_chrome_bookmarks": AppPreferences.includeChromeBookmarks,
             "installed_candidates": cachedInstalledApps.count,
             "bookmark_candidates": cachedBookmarks.count,
             "all_candidates": cachedApps.count
         ])
+    }
+
+    private func refreshVisibleLauncherCandidates() {
+        guard window?.isVisible == true else {
+            return
+        }
+
+        launcherViewController.updateApps(cachedApps)
     }
 
     private func launch(_ app: LaunchableApp) {
