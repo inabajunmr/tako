@@ -28,6 +28,7 @@ Examples:
 
 Environment:
   CODESIGN_IDENTITY   Defaults to "-" for ad-hoc signing.
+  GITHUB_REPOSITORY   Defaults to the origin remote repository for cask URLs.
 USAGE
 }
 
@@ -123,6 +124,8 @@ rm -f "$ZIP_PATH"
 )
 
 echo "Created $ZIP_PATH"
+
+"$ROOT_DIR/scripts/update_cask.sh" "$VERSION"
 
 if [[ "$PUBLISH_TO_GITHUB" == "true" ]]; then
     if ! command -v gh >/dev/null 2>&1; then

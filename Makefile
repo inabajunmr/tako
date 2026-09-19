@@ -8,7 +8,7 @@ MACOS_DIR := $(CONTENTS_DIR)/MacOS
 RESOURCES_DIR := $(CONTENTS_DIR)/Resources
 CODESIGN_IDENTITY ?= -
 
-.PHONY: build run package open release release-github
+.PHONY: build run package open cask release release-github
 
 build:
 	swift build -c release
@@ -29,6 +29,9 @@ package: build
 
 open: package
 	open -n "$(APP_DIR)"
+
+cask:
+	./scripts/update_cask.sh "$(VERSION)"
 
 release:
 	CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" ./scripts/release.sh "$(VERSION)"

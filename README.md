@@ -37,6 +37,7 @@ This creates:
 
 ```text
 dist/Tendon-0.1.0-macos-arm64.zip
+Casks/tendon.rb
 ```
 
 Upload that zip to GitHub Releases. If GitHub CLI is installed and authenticated, this can also
@@ -46,9 +47,25 @@ create or update the GitHub release:
 make release-github VERSION=0.1.0
 ```
 
-Users should unzip it, move `Tendon.app` to `/Applications`, then right-click and choose Open on
-the first launch if macOS blocks the app. Tendon is not notarized, so macOS may also show an
-"Open Anyway" button in System Settings -> Privacy & Security.
+## Install with Homebrew
+
+After the release zip is uploaded to GitHub Releases, this repository can be tapped directly:
+
+```sh
+brew tap inabajunmr/tako https://github.com/inabajunmr/tako
+brew install --cask tendon
+```
+
+This installs `Tendon.app` into `/Applications` through Homebrew's Caskroom.
+
+To update the cask for an already-built release zip:
+
+```sh
+make cask VERSION=0.1.0
+```
+
+Tendon is not notarized, so macOS may block the first launch. Right-click `Tendon.app` and choose
+Open, or use the "Open Anyway" button in System Settings -> Privacy & Security.
 
 ## Controls
 
