@@ -4093,7 +4093,7 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         tableView.dataSource = self
         tableView.delegate = self
         tableView.target = self
-        tableView.doubleAction = #selector(handleDoubleClick(_:))
+        tableView.action = #selector(handleClick(_:))
         tableView.focusRingType = .none
         tableView.onMoveSelection = { [weak self] delta in
             self?.moveSelection(by: delta)
@@ -4185,8 +4185,13 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         return cell
     }
 
-    @objc private func handleDoubleClick(_ sender: Any?) {
-        launchSelectedApp()
+    @objc private func handleClick(_ sender: Any?) {
+        let clickedRow = tableView.clickedRow
+        guard filteredApps.indices.contains(clickedRow) else {
+            return
+        }
+
+        onLaunch?(filteredApps[clickedRow])
     }
 
     private func applyFilter() {

@@ -59,7 +59,7 @@ the first launch if macOS blocks the app. Tendon is not notarized, so macOS may 
 - `Control+N` / `Control+P`: move selection while typing
 - `Enter`: launch the selected app
 - `Esc`: hide Tendon
-- Double-click an item to open it
+- Click an item to open it
 
 Applications are scanned from `/Applications`, `/System/Applications`, and `~/Applications`.
 Currently running regular apps are also included, even when they are outside those folders.
