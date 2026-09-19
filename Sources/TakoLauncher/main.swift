@@ -2953,11 +2953,6 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         applyFilter()
     }
 
-    func updateApps(_ apps: [LaunchableApp]) {
-        self.apps = apps
-        applyFilter()
-    }
-
     func focusSearchField() {
         view.window?.makeFirstResponder(searchField)
     }
@@ -3235,8 +3230,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setupStatusItem() {
         let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        item.button?.title = "Tendon"
-        item.button?.toolTip = "Tendon"
+        if let button = item.button {
+            button.toolTip = "Tendon"
+
+            if let icon = statusItemIcon() {
+                icon.size = NSSize(width: 18, height: 18)
+                icon.isTemplate = false
+                button.image = icon
+                button.imagePosition = .imageOnly
+                button.title = ""
+            } else {
+                button.title = "Tendon"
+            }
+        }
 
         let menu = NSMenu()
         let preferencesItem = NSMenuItem(
@@ -3256,6 +3262,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(quitItem)
         item.menu = menu
         statusItem = item
+    }
+
+    private func statusItemIcon() -> NSImage? {
+        if let bundledIconURL = Bundle.main.url(forResource: "tendon", withExtension: "png") {
+            return NSImage(contentsOf: bundledIconURL)
+        }
+
+        let developmentIconURL = URL(
+            fileURLWithPath: FileManager.default.currentDirectoryPath,
+            isDirectory: true
+        ).appendingPathComponent("assets/tendon.png")
+
+        return NSImage(contentsOf: developmentIconURL)
     }
 
     private func registerHotKey() {
@@ -3333,13 +3352,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func showPreferencesFromMenu() {
+        hideLauncher()
+
         if preferencesWindowController == nil {
             preferencesWindowController = PreferencesWindowController(
                 includeChromeBookmarks: AppPreferences.includeChromeBookmarks,
                 onIncludeChromeBookmarksChanged: { [weak self] includeChromeBookmarks in
                     AppPreferences.includeChromeBookmarks = includeChromeBookmarks
                     self?.refreshApplications(force: true)
-                    self?.refreshVisibleLauncherCandidates()
                     AppLog.write("preferences_changed", [
                         "include_chrome_bookmarks": includeChromeBookmarks
                     ])
@@ -3448,14 +3468,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "bookmark_candidates": cachedBookmarks.count,
             "all_candidates": cachedApps.count
         ])
-    }
-
-    private func refreshVisibleLauncherCandidates() {
-        guard window?.isVisible == true else {
-            return
-        }
-
-        launcherViewController.updateApps(cachedApps)
     }
 
     private func launch(_ app: LaunchableApp) {

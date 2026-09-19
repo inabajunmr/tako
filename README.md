@@ -1,5 +1,7 @@
 # Tendon
 
+![](assets/tendon.png)
+
 Small macOS app for opening apps, windows, and bookmarks quickly.
 
 ## Run
@@ -17,6 +19,31 @@ Open `Preferences...` from the menu bar item to choose whether Chrome bookmarks 
 make package
 open dist/Tendon.app
 ```
+
+## Build a GitHub release zip
+
+Tendon is currently distributed as an unsigned/not-notarized Apple Silicon build.
+
+```sh
+make release VERSION=0.1.0
+```
+
+This creates:
+
+```text
+dist/Tendon-0.1.0-macos-arm64.zip
+```
+
+Upload that zip to GitHub Releases. If GitHub CLI is installed and authenticated, this can also
+create or update the GitHub release:
+
+```sh
+make release-github VERSION=0.1.0
+```
+
+Users should unzip it, move `Tendon.app` to `/Applications`, then right-click and choose Open on
+the first launch if macOS blocks the app. Tendon is not notarized, so macOS may also show an
+"Open Anyway" button in System Settings -> Privacy & Security.
 
 ## Controls
 
