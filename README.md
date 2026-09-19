@@ -17,7 +17,7 @@ Open `Preferences...` from the menu bar item to choose whether Chrome bookmarks 
 
 ```sh
 make package
-open dist/Tendon.app
+open -n dist/Tendon.app
 ```
 
 ## Build a GitHub release zip
@@ -69,6 +69,7 @@ Google Chrome bookmarks are scanned from local Chrome profiles and are included 
 you start typing when that source is enabled. Selecting a bookmark opens it with the default browser.
 Sound input and output devices are included as candidates when you type terms such as `sound input`
 or `sound output`. Selecting one switches the macOS default input or output device.
+When the search field is not empty, the last candidate searches Google for the entered text.
 On startup, Tendon checks its own Screen Recording and Accessibility status, then only
 requests the missing permissions.
 macOS may require Accessibility permission for window focusing and Screen Recording permission for

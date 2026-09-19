@@ -131,6 +131,7 @@ enum LaunchTargetKind: Hashable {
     case bookmark
     case audioInput
     case audioOutput
+    case webSearch
 
     var logValue: String {
         switch self {
@@ -144,6 +145,8 @@ enum LaunchTargetKind: Hashable {
             return "audio_input"
         case .audioOutput:
             return "audio_output"
+        case .webSearch:
+            return "web_search"
         }
     }
 }
@@ -227,6 +230,8 @@ struct LaunchableApp: Hashable {
         case .audioOutput:
             let suffix = applicationName.map { " - \($0)" } ?? ""
             return "Sound Output\(suffix)"
+        case .webSearch:
+            return url?.absoluteString ?? "Google Search"
         }
     }
 
@@ -247,7 +252,7 @@ struct LaunchableApp: Hashable {
             switch targetKind {
             case .application, .window:
                 return true
-            case .bookmark, .audioInput, .audioOutput:
+            case .bookmark, .audioInput, .audioOutput, .webSearch:
                 return false
             }
         }
@@ -1204,7 +1209,7 @@ private enum AudioDeviceDiscovery {
                 "default_system_output_status": Int(systemOutputStatus)
             ])
             return outputStatus == noErr
-        case .application, .window, .bookmark:
+        case .application, .window, .bookmark, .webSearch:
             return false
         }
     }
@@ -1224,7 +1229,7 @@ private enum AudioDeviceDiscovery {
         case .audioOutput:
             searchAliases = ["sound output", "audio output", "speaker", "headphones", "output"]
             historyPrefix = "audio-output"
-        case .application, .window, .bookmark:
+        case .application, .window, .bookmark, .webSearch:
             searchAliases = []
             historyPrefix = "audio"
         }
@@ -1424,9 +1429,51 @@ private enum AudioDeviceDiscovery {
             return 0
         case .audioOutput:
             return 1
-        case .application, .window, .bookmark:
+        case .application, .window, .bookmark, .webSearch:
             return 2
         }
+    }
+}
+
+private enum WebSearchCandidateFactory {
+    static func candidate(for query: String) -> LaunchableApp? {
+        let trimmedQuery = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedQuery.isEmpty else {
+            return nil
+        }
+
+        var components = URLComponents(string: "https://www.google.com/search")
+        components?.queryItems = [
+            URLQueryItem(name: "q", value: trimmedQuery)
+        ]
+
+        guard let url = components?.url else {
+            return nil
+        }
+
+        let identityKey = "web-search:google:\(trimmedQuery)"
+        let searchText = [
+            trimmedQuery,
+            "google",
+            "search",
+            "web"
+        ].joined(separator: " ")
+
+        return LaunchableApp(
+            name: "Google 検索: \(trimmedQuery)",
+            applicationName: "Google",
+            url: url,
+            bundleIdentifier: nil,
+            searchText: searchText,
+            identityKey: identityKey,
+            historyKey: identityKey,
+            processIdentifier: nil,
+            isRunning: false,
+            targetKind: .webSearch,
+            windowTitle: nil,
+            windowFrame: nil,
+            windowIdentifier: nil
+        )
     }
 }
 
@@ -1610,6 +1657,8 @@ enum WindowActivator {
         case .bookmark:
             return false
         case .audioInput, .audioOutput:
+            return false
+        case .webSearch:
             return false
         }
     }
@@ -3359,7 +3408,9 @@ final class AppCellView: NSTableCellView {
     }
 
     func configure(with app: LaunchableApp) {
-        if let audioIcon = icon(forAudioTargetKind: app.targetKind) {
+        if app.targetKind == .webSearch {
+            appIconView.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
+        } else if let audioIcon = icon(forAudioTargetKind: app.targetKind) {
             appIconView.image = audioIcon
         } else if app.targetKind == .bookmark {
             appIconView.image = NSWorkspace.shared.icon(for: .url)
@@ -3384,7 +3435,7 @@ final class AppCellView: NSTableCellView {
             return NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
         case .audioOutput:
             return NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: nil)
-        case .application, .window, .bookmark:
+        case .application, .window, .bookmark, .webSearch:
             return nil
         }
     }
@@ -3723,6 +3774,10 @@ final class LauncherViewController: NSViewController, NSTableViewDataSource, NST
         let matchingApps = apps.filter { $0.matches(query) }
         filteredApps = sortApps?(matchingApps) ?? matchingApps
 
+        if let webSearchCandidate = WebSearchCandidateFactory.candidate(for: query) {
+            filteredApps.append(webSearchCandidate)
+        }
+
         tableView.reloadData()
         emptyLabel.isHidden = !filteredApps.isEmpty
 
@@ -3770,9 +3825,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var lastScanDate = Date.distantPast
     private var previousFrontmostProcessIdentifier: pid_t?
     private var previousFrontmostWindowTitle: String?
+    private var isRelaunchingFromReopen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppLog.start()
+        terminateOtherRunningInstances()
         NSApp.setActivationPolicy(.accessory)
         setupWindow()
         setupStatusItem()
@@ -3785,6 +3842,126 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "cached_audio_devices": cachedAudioDevices.count,
             "cached_apps": cachedApps.count
         ])
+    }
+
+    func applicationShouldHandleReopen(
+        _ sender: NSApplication,
+        hasVisibleWindows flag: Bool
+    ) -> Bool {
+        relaunchCurrentBundleAndTerminate(reason: "reopen")
+        return false
+    }
+
+    private func relaunchCurrentBundleAndTerminate(reason: String) {
+        guard !isRelaunchingFromReopen else {
+            return
+        }
+
+        isRelaunchingFromReopen = true
+
+        let bundleURL = Bundle.main.bundleURL
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/open")
+        process.arguments = ["-n", bundleURL.path]
+
+        do {
+            try process.run()
+            AppLog.write("relaunch_current_bundle", [
+                "reason": reason,
+                "bundle_path": bundleURL.path,
+                "result": "started"
+            ])
+            NSApp.terminate(nil)
+        } catch {
+            isRelaunchingFromReopen = false
+            AppLog.write("relaunch_current_bundle", [
+                "reason": reason,
+                "bundle_path": bundleURL.path,
+                "result": "failed",
+                "error": error.localizedDescription
+            ])
+            showLauncher()
+        }
+    }
+
+    private func terminateOtherRunningInstances() {
+        let currentProcessIdentifier = ProcessInfo.processInfo.processIdentifier
+        let currentBundleIdentifier = Bundle.main.bundleIdentifier
+        let knownBundleIdentifiers = [
+            currentBundleIdentifier,
+            "com.juninaba.TakoLauncher"
+        ].compactMap { $0 }
+
+        let otherApplications = NSWorkspace.shared.runningApplications.filter { runningApplication in
+            guard runningApplication.processIdentifier != currentProcessIdentifier else {
+                return false
+            }
+
+            return knownBundleIdentifiers.contains { bundleIdentifier in
+                runningApplication.bundleIdentifier == bundleIdentifier
+            }
+        }
+
+        guard !otherApplications.isEmpty else {
+            AppLog.write("terminate_other_instances", [
+                "result": "none"
+            ])
+            return
+        }
+
+        let terminationRequests = otherApplications.map { runningApplication -> [String: Any] in
+            let requested = runningApplication.terminate()
+            return [
+                "pid": Int(runningApplication.processIdentifier),
+                "bundle_id": runningApplication.bundleIdentifier ?? "nil",
+                "bundle_url": runningApplication.bundleURL?.path ?? "nil",
+                "terminate_requested": requested
+            ]
+        }
+
+        waitForTermination(of: otherApplications, timeout: 1.5)
+
+        let forceTerminationRequests = otherApplications
+            .filter { !$0.isTerminated }
+            .map { runningApplication -> [String: Any] in
+                let requested = runningApplication.forceTerminate()
+                return [
+                    "pid": Int(runningApplication.processIdentifier),
+                    "bundle_id": runningApplication.bundleIdentifier ?? "nil",
+                    "force_terminate_requested": requested
+                ]
+            }
+
+        if !forceTerminationRequests.isEmpty {
+            waitForTermination(of: otherApplications, timeout: 0.8)
+        }
+
+        AppLog.write("terminate_other_instances", [
+            "result": "attempted",
+            "termination_requests": terminationRequests,
+            "force_termination_requests": forceTerminationRequests,
+            "remaining_pids": otherApplications
+                .filter { !$0.isTerminated }
+                .map { Int($0.processIdentifier) }
+        ])
+    }
+
+    private func waitForTermination(
+        of applications: [NSRunningApplication],
+        timeout: TimeInterval
+    ) {
+        let deadline = Date().addingTimeInterval(timeout)
+
+        while Date() < deadline {
+            guard applications.contains(where: { !$0.isTerminated }) else {
+                return
+            }
+
+            RunLoop.current.run(
+                mode: .default,
+                before: Date().addingTimeInterval(0.05)
+            )
+        }
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -4105,6 +4282,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
+        if app.targetKind == .webSearch {
+            launchWebSearch(app)
+            return
+        }
+
         if app.targetKind == .bookmark {
             guard let url = app.url else {
                 NSSound.beep()
@@ -4197,6 +4379,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     "url": url.path
                 ])
             }
+        }
+    }
+
+    private func launchWebSearch(_ app: LaunchableApp) {
+        guard let url = app.url else {
+            NSSound.beep()
+            AppLog.write("launch_failed", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "reason": "missing_web_search_url"
+            ])
+            return
+        }
+
+        if NSWorkspace.shared.open(url) {
+            AppLog.write("launch_completed", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "url": url.absoluteString
+            ])
+        } else {
+            NSSound.beep()
+            AppLog.write("launch_failed", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "reason": "failed_to_open_web_search_url"
+            ])
         }
     }
 

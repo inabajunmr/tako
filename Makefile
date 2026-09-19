@@ -28,7 +28,7 @@ package: build
 	touch "$(APP_DIR)"
 
 open: package
-	open "$(APP_DIR)"
+	open -n "$(APP_DIR)"
 
 release:
 	CODESIGN_IDENTITY="$(CODESIGN_IDENTITY)" ./scripts/release.sh "$(VERSION)"
