@@ -1,6 +1,6 @@
 # Tendon
 
-![](assets/tendon.png)
+![](assets/tendon_black.png)
 
 Small macOS app for opening apps, windows, and bookmarks quickly.
 
