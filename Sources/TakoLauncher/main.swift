@@ -1523,18 +1523,18 @@ final class LaunchHistoryStore {
         apps.sorted { lhs, rhs in
             let lhsEntry = entries[lhs.historyKey]
             let rhsEntry = entries[rhs.historyKey]
-            let lhsCount = lhsEntry?.count ?? 0
-            let rhsCount = rhsEntry?.count ?? 0
-
-            if lhsCount != rhsCount {
-                return lhsCount > rhsCount
-            }
-
             let lhsLastLaunchedAt = lhsEntry?.lastLaunchedAt ?? .distantPast
             let rhsLastLaunchedAt = rhsEntry?.lastLaunchedAt ?? .distantPast
 
             if lhsLastLaunchedAt != rhsLastLaunchedAt {
                 return lhsLastLaunchedAt > rhsLastLaunchedAt
+            }
+
+            let lhsCount = lhsEntry?.count ?? 0
+            let rhsCount = rhsEntry?.count ?? 0
+
+            if lhsCount != rhsCount {
+                return lhsCount > rhsCount
             }
 
             return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
