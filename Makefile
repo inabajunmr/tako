@@ -1,3 +1,5 @@
+-include local.env
+
 APP_NAME := Tendon
 BUILD_DIR := .build/release
 APP_DIR := dist/$(APP_NAME).app

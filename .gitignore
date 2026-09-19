@@ -2,4 +2,5 @@
 .swiftpm/
 dist/
 logs/
+local.env
 .DS_Store

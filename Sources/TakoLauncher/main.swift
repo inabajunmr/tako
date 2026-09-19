@@ -1,6 +1,8 @@
 import AppKit
 import ApplicationServices
 import Carbon
+import CoreAudio
+import CryptoKit
 import Darwin
 import ScreenCaptureKit
 import UniformTypeIdentifiers
@@ -127,6 +129,8 @@ enum LaunchTargetKind: Hashable {
     case application
     case window
     case bookmark
+    case audioInput
+    case audioOutput
 
     var logValue: String {
         switch self {
@@ -136,6 +140,10 @@ enum LaunchTargetKind: Hashable {
             return "window"
         case .bookmark:
             return "bookmark"
+        case .audioInput:
+            return "audio_input"
+        case .audioOutput:
+            return "audio_output"
         }
     }
 }
@@ -161,6 +169,42 @@ struct LaunchableApp: Hashable {
     let windowTitle: String?
     let windowFrame: WindowFrame?
     let windowIdentifier: UInt32?
+    let audioDeviceIdentifier: AudioDeviceID?
+    let audioDeviceUID: String?
+
+    init(
+        name: String,
+        applicationName: String?,
+        url: URL?,
+        bundleIdentifier: String?,
+        searchText: String,
+        identityKey: String,
+        historyKey: String,
+        processIdentifier: pid_t?,
+        isRunning: Bool,
+        targetKind: LaunchTargetKind,
+        windowTitle: String?,
+        windowFrame: WindowFrame?,
+        windowIdentifier: UInt32?,
+        audioDeviceIdentifier: AudioDeviceID? = nil,
+        audioDeviceUID: String? = nil
+    ) {
+        self.name = name
+        self.applicationName = applicationName
+        self.url = url
+        self.bundleIdentifier = bundleIdentifier
+        self.searchText = searchText
+        self.identityKey = identityKey
+        self.historyKey = historyKey
+        self.processIdentifier = processIdentifier
+        self.isRunning = isRunning
+        self.targetKind = targetKind
+        self.windowTitle = windowTitle
+        self.windowFrame = windowFrame
+        self.windowIdentifier = windowIdentifier
+        self.audioDeviceIdentifier = audioDeviceIdentifier
+        self.audioDeviceUID = audioDeviceUID
+    }
 
     var subtitle: String {
         switch targetKind {
@@ -177,6 +221,12 @@ struct LaunchableApp: Hashable {
             }
 
             return "Bookmark - \(detail)"
+        case .audioInput:
+            let suffix = applicationName.map { " - \($0)" } ?? ""
+            return "Sound Input\(suffix)"
+        case .audioOutput:
+            let suffix = applicationName.map { " - \($0)" } ?? ""
+            return "Sound Output\(suffix)"
         }
     }
 
@@ -194,7 +244,12 @@ struct LaunchableApp: Hashable {
             .filter { !$0.isEmpty }
 
         guard !tokens.isEmpty else {
-            return targetKind != .bookmark
+            switch targetKind {
+            case .application, .window:
+                return true
+            case .bookmark, .audioInput, .audioOutput:
+                return false
+            }
         }
 
         return tokens.allSatisfy { token in
@@ -222,7 +277,9 @@ struct LaunchableApp: Hashable {
             targetKind: targetKind,
             windowTitle: windowTitle,
             windowFrame: windowFrame,
-            windowIdentifier: windowIdentifier
+            windowIdentifier: windowIdentifier,
+            audioDeviceIdentifier: audioDeviceIdentifier,
+            audioDeviceUID: audioDeviceUID
         )
     }
 }
@@ -1050,6 +1107,329 @@ private enum ChromeBookmarkDiscovery {
     }
 }
 
+private enum AudioDeviceDiscovery {
+    private struct DeviceInfo {
+        let identifier: AudioDeviceID
+        let uid: String
+        let name: String
+    }
+
+    private static let systemObjectID = AudioObjectID(kAudioObjectSystemObject)
+
+    static func loadDevices() -> [LaunchableApp] {
+        let defaultInputDevice = defaultDevice(
+            selector: kAudioHardwarePropertyDefaultInputDevice
+        )
+        let defaultOutputDevice = defaultDevice(
+            selector: kAudioHardwarePropertyDefaultOutputDevice
+        )
+
+        let devices = deviceIdentifiers().compactMap(deviceInfo)
+        var candidates: [LaunchableApp] = []
+
+        for device in devices where hasStreams(
+            deviceID: device.identifier,
+            scope: kAudioObjectPropertyScopeInput
+        ) {
+            candidates.append(
+                makeCandidate(
+                    device: device,
+                    kind: .audioInput,
+                    isCurrent: device.identifier == defaultInputDevice
+                )
+            )
+        }
+
+        for device in devices where hasStreams(
+            deviceID: device.identifier,
+            scope: kAudioObjectPropertyScopeOutput
+        ) {
+            candidates.append(
+                makeCandidate(
+                    device: device,
+                    kind: .audioOutput,
+                    isCurrent: device.identifier == defaultOutputDevice
+                )
+            )
+        }
+
+        return candidates.sorted {
+            if $0.targetKind != $1.targetKind {
+                return sortRank(for: $0.targetKind) < sortRank(for: $1.targetKind)
+            }
+
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }
+    }
+
+    static func setDefaultDevice(for app: LaunchableApp) -> Bool {
+        guard let deviceID = app.audioDeviceIdentifier else {
+            AppLog.write("audio_device_switch_failed", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "reason": "missing_audio_device_id"
+            ])
+            return false
+        }
+
+        switch app.targetKind {
+        case .audioInput:
+            let inputStatus = setDefaultDevice(
+                deviceID,
+                selector: kAudioHardwarePropertyDefaultInputDevice
+            )
+            AppLog.write("audio_device_switch", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "device_id": Int(deviceID),
+                "device_uid": app.audioDeviceUID ?? "nil",
+                "default_input_status": Int(inputStatus)
+            ])
+            return inputStatus == noErr
+        case .audioOutput:
+            let outputStatus = setDefaultDevice(
+                deviceID,
+                selector: kAudioHardwarePropertyDefaultOutputDevice
+            )
+            let systemOutputStatus = setDefaultDevice(
+                deviceID,
+                selector: kAudioHardwarePropertyDefaultSystemOutputDevice
+            )
+            AppLog.write("audio_device_switch", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "device_id": Int(deviceID),
+                "device_uid": app.audioDeviceUID ?? "nil",
+                "default_output_status": Int(outputStatus),
+                "default_system_output_status": Int(systemOutputStatus)
+            ])
+            return outputStatus == noErr
+        case .application, .window, .bookmark:
+            return false
+        }
+    }
+
+    private static func makeCandidate(
+        device: DeviceInfo,
+        kind: LaunchTargetKind,
+        isCurrent: Bool
+    ) -> LaunchableApp {
+        let searchAliases: [String]
+        let historyPrefix: String
+
+        switch kind {
+        case .audioInput:
+            searchAliases = ["sound input", "audio input", "microphone", "mic", "input"]
+            historyPrefix = "audio-input"
+        case .audioOutput:
+            searchAliases = ["sound output", "audio output", "speaker", "headphones", "output"]
+            historyPrefix = "audio-output"
+        case .application, .window, .bookmark:
+            searchAliases = []
+            historyPrefix = "audio"
+        }
+
+        let historyKey = "\(historyPrefix):\(device.uid)"
+        var searchTextParts: [String?] = [device.name, device.uid]
+        searchTextParts.append(contentsOf: searchAliases.map(Optional.some))
+        searchTextParts.append(isCurrent ? "current default selected active" : nil)
+        let searchText = searchTextParts
+            .compactMap { $0 }
+            .joined(separator: " ")
+
+        return LaunchableApp(
+            name: device.name,
+            applicationName: isCurrent ? "Current" : nil,
+            url: nil,
+            bundleIdentifier: nil,
+            searchText: searchText,
+            identityKey: historyKey,
+            historyKey: historyKey,
+            processIdentifier: nil,
+            isRunning: false,
+            targetKind: kind,
+            windowTitle: nil,
+            windowFrame: nil,
+            windowIdentifier: nil,
+            audioDeviceIdentifier: device.identifier,
+            audioDeviceUID: device.uid
+        )
+    }
+
+    private static func deviceIdentifiers() -> [AudioDeviceID] {
+        var address = propertyAddress(selector: kAudioHardwarePropertyDevices)
+        var dataSize: UInt32 = 0
+        let sizeStatus = AudioObjectGetPropertyDataSize(
+            systemObjectID,
+            &address,
+            0,
+            nil,
+            &dataSize
+        )
+
+        guard
+            sizeStatus == noErr,
+            dataSize >= UInt32(MemoryLayout<AudioDeviceID>.size)
+        else {
+            AppLog.write("audio_device_scan_failed", [
+                "step": "devices_size",
+                "status": Int(sizeStatus),
+                "data_size": Int(dataSize)
+            ])
+            return []
+        }
+
+        let deviceCount = Int(dataSize) / MemoryLayout<AudioDeviceID>.size
+        var deviceIDs = [AudioDeviceID](
+            repeating: AudioDeviceID(kAudioObjectUnknown),
+            count: deviceCount
+        )
+
+        let dataStatus = deviceIDs.withUnsafeMutableBufferPointer { buffer in
+            AudioObjectGetPropertyData(
+                systemObjectID,
+                &address,
+                0,
+                nil,
+                &dataSize,
+                buffer.baseAddress!
+            )
+        }
+
+        guard dataStatus == noErr else {
+            AppLog.write("audio_device_scan_failed", [
+                "step": "devices",
+                "status": Int(dataStatus)
+            ])
+            return []
+        }
+
+        return deviceIDs.filter { $0 != AudioDeviceID(kAudioObjectUnknown) }
+    }
+
+    private static func deviceInfo(for deviceID: AudioDeviceID) -> DeviceInfo? {
+        let uid = stringProperty(
+            kAudioDevicePropertyDeviceUID,
+            of: AudioObjectID(deviceID)
+        ) ?? "device-\(deviceID)"
+        let name = stringProperty(
+            kAudioObjectPropertyName,
+            of: AudioObjectID(deviceID)
+        ) ?? uid
+
+        return DeviceInfo(
+            identifier: deviceID,
+            uid: uid,
+            name: name
+        )
+    }
+
+    private static func hasStreams(
+        deviceID: AudioDeviceID,
+        scope: AudioObjectPropertyScope
+    ) -> Bool {
+        var address = propertyAddress(
+            selector: kAudioDevicePropertyStreams,
+            scope: scope
+        )
+        var dataSize: UInt32 = 0
+        let status = AudioObjectGetPropertyDataSize(
+            AudioObjectID(deviceID),
+            &address,
+            0,
+            nil,
+            &dataSize
+        )
+
+        return status == noErr && dataSize >= UInt32(MemoryLayout<AudioStreamID>.size)
+    }
+
+    private static func defaultDevice(
+        selector: AudioObjectPropertySelector
+    ) -> AudioDeviceID? {
+        var address = propertyAddress(selector: selector)
+        var deviceID = AudioDeviceID(kAudioObjectUnknown)
+        var dataSize = UInt32(MemoryLayout<AudioDeviceID>.size)
+        let status = AudioObjectGetPropertyData(
+            systemObjectID,
+            &address,
+            0,
+            nil,
+            &dataSize,
+            &deviceID
+        )
+
+        guard status == noErr, deviceID != AudioDeviceID(kAudioObjectUnknown) else {
+            return nil
+        }
+
+        return deviceID
+    }
+
+    private static func setDefaultDevice(
+        _ deviceID: AudioDeviceID,
+        selector: AudioObjectPropertySelector
+    ) -> OSStatus {
+        var address = propertyAddress(selector: selector)
+        var mutableDeviceID = deviceID
+        return AudioObjectSetPropertyData(
+            systemObjectID,
+            &address,
+            0,
+            nil,
+            UInt32(MemoryLayout<AudioDeviceID>.size),
+            &mutableDeviceID
+        )
+    }
+
+    private static func stringProperty(
+        _ selector: AudioObjectPropertySelector,
+        of objectID: AudioObjectID
+    ) -> String? {
+        var address = propertyAddress(selector: selector)
+        var value: Unmanaged<CFString>?
+        var dataSize = UInt32(MemoryLayout<Unmanaged<CFString>?>.size)
+        let status = AudioObjectGetPropertyData(
+            objectID,
+            &address,
+            0,
+            nil,
+            &dataSize,
+            &value
+        )
+
+        guard status == noErr, let value else {
+            return nil
+        }
+
+        let string = (value.takeRetainedValue() as String)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return string.isEmpty ? nil : string
+    }
+
+    private static func propertyAddress(
+        selector: AudioObjectPropertySelector,
+        scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
+    ) -> AudioObjectPropertyAddress {
+        AudioObjectPropertyAddress(
+            mSelector: selector,
+            mScope: scope,
+            mElement: kAudioObjectPropertyElementMain
+        )
+    }
+
+    private static func sortRank(for kind: LaunchTargetKind) -> Int {
+        switch kind {
+        case .audioInput:
+            return 0
+        case .audioOutput:
+            return 1
+        case .application, .window, .bookmark:
+            return 2
+        }
+    }
+}
+
 private struct LaunchHistoryEntry: Codable {
     var count: Int
     var lastLaunchedAt: Date
@@ -1228,6 +1608,8 @@ enum WindowActivator {
         case .window:
             return activateWindow(for: app)
         case .bookmark:
+            return false
+        case .audioInput, .audioOutput:
             return false
         }
     }
@@ -2527,6 +2909,7 @@ enum WindowActivator {
 
 enum WindowPermissionManager {
     private static var isStartupPermissionSequenceRunning = false
+    private static var didResetPrivacyPermissionsForMissingGrant = false
     private static var permissionPollTimer: Timer?
 
     static func requestStartupPermissions() {
@@ -2534,9 +2917,17 @@ enum WindowPermissionManager {
             return
         }
 
-        guard !isScreenRecordingGranted || !isAccessibilityGranted else {
+        let missingScreenRecording = !isScreenRecordingGranted
+        let missingAccessibility = !isAccessibilityGranted
+
+        guard missingScreenRecording || missingAccessibility else {
             return
         }
+
+        resetPrivacyPermissionsIfNeeded(
+            missingScreenRecording: missingScreenRecording,
+            missingAccessibility: missingAccessibility
+        )
 
         isStartupPermissionSequenceRunning = true
         requestScreenRecordingPermission {
@@ -2629,6 +3020,156 @@ enum WindowPermissionManager {
         NSWorkspace.shared.open(url)
     }
 
+    private static func resetPrivacyPermissionsIfNeeded(
+        missingScreenRecording: Bool,
+        missingAccessibility: Bool
+    ) {
+        guard !didResetPrivacyPermissionsForMissingGrant else {
+            return
+        }
+
+        didResetPrivacyPermissionsForMissingGrant = true
+
+        guard let bundleIdentifier = Bundle.main.bundleIdentifier else {
+            AppLog.write("privacy_permissions_reset_skipped", [
+                "reason": "missing_bundle_identifier",
+                "missing_screen_recording": missingScreenRecording,
+                "missing_accessibility": missingAccessibility
+            ])
+            return
+        }
+
+        let buildFingerprint = currentBuildFingerprint()
+        let services = resettablePrivacyServices(
+            missingScreenRecording: missingScreenRecording,
+            missingAccessibility: missingAccessibility,
+            buildFingerprint: buildFingerprint
+        )
+
+        guard !services.isEmpty else {
+            AppLog.write("privacy_permissions_reset_skipped", [
+                "reason": "already_reset_for_this_build",
+                "bundle_id": bundleIdentifier,
+                "build_fingerprint": buildFingerprint,
+                "missing_screen_recording": missingScreenRecording,
+                "missing_accessibility": missingAccessibility
+            ])
+            return
+        }
+
+        let results = services.map { service in
+            let result = resetPrivacyPermission(
+                service: service,
+                bundleIdentifier: bundleIdentifier
+            )
+            markPrivacyPermissionResetAttempted(
+                service: service,
+                buildFingerprint: buildFingerprint
+            )
+            return result.logPayload(service: service)
+        }
+
+        AppLog.write("privacy_permissions_reset", [
+            "bundle_id": bundleIdentifier,
+            "build_fingerprint": buildFingerprint,
+            "missing_screen_recording": missingScreenRecording,
+            "missing_accessibility": missingAccessibility,
+            "services": results
+        ])
+    }
+
+    private static func resettablePrivacyServices(
+        missingScreenRecording: Bool,
+        missingAccessibility: Bool,
+        buildFingerprint: String
+    ) -> [String] {
+        [
+            (missingScreenRecording, "ScreenCapture"),
+            (missingAccessibility, "Accessibility")
+        ]
+            .filter { isMissing, service in
+                isMissing && !hasResetPrivacyPermission(
+                    service: service,
+                    buildFingerprint: buildFingerprint
+                )
+            }
+            .map(\.1)
+    }
+
+    private static func hasResetPrivacyPermission(
+        service: String,
+        buildFingerprint: String
+    ) -> Bool {
+        UserDefaults.standard.string(forKey: privacyResetUserDefaultsKey(for: service)) == buildFingerprint
+    }
+
+    private static func markPrivacyPermissionResetAttempted(
+        service: String,
+        buildFingerprint: String
+    ) {
+        UserDefaults.standard.set(buildFingerprint, forKey: privacyResetUserDefaultsKey(for: service))
+    }
+
+    private static func privacyResetUserDefaultsKey(for service: String) -> String {
+        "privacyResetBuildFingerprint.\(service)"
+    }
+
+    private static func resetPrivacyPermission(
+        service: String,
+        bundleIdentifier: String
+    ) -> ProcessResult {
+        let process = Process()
+        let standardOutputPipe = Pipe()
+        let standardErrorPipe = Pipe()
+
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/tccutil")
+        process.arguments = ["reset", service, bundleIdentifier]
+        process.standardOutput = standardOutputPipe
+        process.standardError = standardErrorPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+        } catch {
+            return ProcessResult(
+                terminationStatus: -1,
+                standardOutput: "",
+                standardError: error.localizedDescription
+            )
+        }
+
+        return ProcessResult(
+            terminationStatus: process.terminationStatus,
+            standardOutput: readString(from: standardOutputPipe),
+            standardError: readString(from: standardErrorPipe)
+        )
+    }
+
+    private static func currentBuildFingerprint() -> String {
+        guard
+            let executableURL = Bundle.main.executableURL,
+            let data = try? Data(contentsOf: executableURL)
+        else {
+            return [
+                Bundle.main.bundleIdentifier ?? "unknown-bundle",
+                Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "unknown-version",
+                Bundle.main.executableURL?.path ?? "unknown-executable"
+            ]
+                .compactMap { $0 }
+                .joined(separator: ":")
+        }
+
+        return SHA256.hash(data: data)
+            .map { String(format: "%02x", $0) }
+            .joined()
+    }
+
+    private static func readString(from pipe: Pipe) -> String {
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        let output = String(data: data, encoding: .utf8) ?? ""
+        return output.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
     private static var isAccessibilityGranted: Bool {
         AXIsProcessTrusted()
     }
@@ -2636,10 +3177,34 @@ enum WindowPermissionManager {
     private static var isScreenRecordingGranted: Bool {
         CGPreflightScreenCaptureAccess()
     }
+
+    private struct ProcessResult {
+        let terminationStatus: Int32
+        let standardOutput: String
+        let standardError: String
+
+        var isSuccess: Bool {
+            terminationStatus == 0
+        }
+
+        func logPayload(service: String) -> [String: Any] {
+            [
+                "service": service,
+                "success": isSuccess,
+                "termination_status": terminationStatus,
+                "stdout": standardOutput,
+                "stderr": standardError
+            ]
+        }
+    }
 }
 
 private enum LauncherKey {
     static let a: UInt16 = 0
+    static let z: UInt16 = 6
+    static let x: UInt16 = 7
+    static let c: UInt16 = 8
+    static let v: UInt16 = 9
     static let returnKey: UInt16 = 36
     static let keypadEnter: UInt16 = 76
     static let escape: UInt16 = 53
@@ -2655,6 +3220,10 @@ private enum LauncherKey {
     static func isCommandPressed(_ event: NSEvent) -> Bool {
         event.modifierFlags.contains(.command)
     }
+
+    static func isShiftPressed(_ event: NSEvent) -> Bool {
+        event.modifierFlags.contains(.shift)
+    }
 }
 
 final class LauncherSearchField: NSSearchField {
@@ -2663,14 +3232,36 @@ final class LauncherSearchField: NSSearchField {
     var onCancel: (() -> Void)?
 
     override func performKeyEquivalent(with event: NSEvent) -> Bool {
-        guard LauncherKey.isCommandPressed(event), event.keyCode == LauncherKey.a else {
+        guard LauncherKey.isCommandPressed(event) else {
             return super.performKeyEquivalent(with: event)
         }
 
-        if let editor = currentEditor() {
+        guard let editor = currentEditor() else {
+            if event.keyCode == LauncherKey.a {
+                selectText(nil)
+                return true
+            }
+
+            return super.performKeyEquivalent(with: event)
+        }
+
+        switch event.keyCode {
+        case LauncherKey.a:
             editor.selectAll(nil)
-        } else {
-            selectText(nil)
+        case LauncherKey.c:
+            editor.copy(nil)
+        case LauncherKey.x:
+            editor.cut(nil)
+        case LauncherKey.v:
+            editor.paste(nil)
+        case LauncherKey.z:
+            if LauncherKey.isShiftPressed(event) {
+                editor.undoManager?.redo()
+            } else {
+                editor.undoManager?.undo()
+            }
+        default:
+            return super.performKeyEquivalent(with: event)
         }
 
         return true
@@ -2768,7 +3359,9 @@ final class AppCellView: NSTableCellView {
     }
 
     func configure(with app: LaunchableApp) {
-        if app.targetKind == .bookmark {
+        if let audioIcon = icon(forAudioTargetKind: app.targetKind) {
+            appIconView.image = audioIcon
+        } else if app.targetKind == .bookmark {
             appIconView.image = NSWorkspace.shared.icon(for: .url)
         } else if let url = app.url {
             appIconView.image = NSWorkspace.shared.icon(forFile: url.path)
@@ -2783,6 +3376,17 @@ final class AppCellView: NSTableCellView {
 
         titleLabel.stringValue = app.name
         detailLabel.stringValue = app.subtitle
+    }
+
+    private func icon(forAudioTargetKind targetKind: LaunchTargetKind) -> NSImage? {
+        switch targetKind {
+        case .audioInput:
+            return NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
+        case .audioOutput:
+            return NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: nil)
+        case .application, .window, .bookmark:
+            return nil
+        }
     }
 
     private func setup() {
@@ -3161,6 +3765,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var eventHandlerRef: EventHandlerRef?
     private var cachedInstalledApps: [LaunchableApp] = []
     private var cachedBookmarks: [LaunchableApp] = []
+    private var cachedAudioDevices: [LaunchableApp] = []
     private var cachedApps: [LaunchableApp] = []
     private var lastScanDate = Date.distantPast
     private var previousFrontmostProcessIdentifier: pid_t?
@@ -3177,6 +3782,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         AppLog.write("application_did_finish_launching", [
             "cached_installed_apps": cachedInstalledApps.count,
             "cached_bookmarks": cachedBookmarks.count,
+            "cached_audio_devices": cachedAudioDevices.count,
             "cached_apps": cachedApps.count
         ])
     }
@@ -3460,14 +4066,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             lastScanDate = Date()
         }
 
-        cachedApps = AppDiscovery.includeRunningApplications(in: cachedInstalledApps) + cachedBookmarks
+        cachedAudioDevices = AudioDeviceDiscovery.loadDevices()
+        rebuildCandidateCache()
         AppLog.write("refresh_applications", [
             "force": force,
             "include_chrome_bookmarks": AppPreferences.includeChromeBookmarks,
             "installed_candidates": cachedInstalledApps.count,
             "bookmark_candidates": cachedBookmarks.count,
+            "audio_device_candidates": cachedAudioDevices.count,
             "all_candidates": cachedApps.count
         ])
+    }
+
+    private func rebuildCandidateCache() {
+        cachedApps = AppDiscovery.includeRunningApplications(in: cachedInstalledApps) +
+            cachedBookmarks +
+            cachedAudioDevices
     }
 
     private func launch(_ app: LaunchableApp) {
@@ -3481,8 +4095,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "target_kind": app.targetKind.logValue,
             "window_title": (app.windowTitle ?? "nil") as String,
             "window_identifier": logWindowIdentifier(app.windowIdentifier),
-            "window_frame": logFrame(app.windowFrame)
+            "window_frame": logFrame(app.windowFrame),
+            "audio_device_id": logAudioDeviceIdentifier(app.audioDeviceIdentifier),
+            "audio_device_uid": app.audioDeviceUID ?? "nil"
         ])
+
+        if app.targetKind == .audioInput || app.targetKind == .audioOutput {
+            launchAudioDevice(app)
+            return
+        }
 
         if app.targetKind == .bookmark {
             guard let url = app.url else {
@@ -3579,6 +4200,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
+    private func launchAudioDevice(_ app: LaunchableApp) {
+        if AudioDeviceDiscovery.setDefaultDevice(for: app) {
+            launchHistoryStore.recordLaunch(of: app)
+            cachedAudioDevices = AudioDeviceDiscovery.loadDevices()
+            rebuildCandidateCache()
+            AppLog.write("launch_completed", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "audio_device_id": logAudioDeviceIdentifier(app.audioDeviceIdentifier),
+                "audio_device_uid": app.audioDeviceUID ?? "nil"
+            ])
+        } else {
+            NSSound.beep()
+            AppLog.write("launch_failed", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "audio_device_id": logAudioDeviceIdentifier(app.audioDeviceIdentifier),
+                "audio_device_uid": app.audioDeviceUID ?? "nil",
+                "reason": "failed_to_switch_audio_device"
+            ])
+        }
+    }
+
     private func logFrame(_ frame: WindowFrame?) -> [String: Any] {
         guard let frame else {
             return [:]
@@ -3598,6 +4242,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func logWindowIdentifier(_ windowIdentifier: UInt32?) -> Any {
         windowIdentifier.map { Int($0) } ?? NSNull()
+    }
+
+    private func logAudioDeviceIdentifier(_ audioDeviceIdentifier: AudioDeviceID?) -> Any {
+        audioDeviceIdentifier.map { Int($0) } ?? NSNull()
     }
 }
 
