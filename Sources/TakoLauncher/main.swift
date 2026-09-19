@@ -4,6 +4,8 @@ import Carbon
 import CoreAudio
 import CryptoKit
 import Darwin
+import IOBluetooth
+import IOKit
 import ScreenCaptureKit
 import UniformTypeIdentifiers
 
@@ -132,6 +134,8 @@ enum LaunchTargetKind: Hashable {
     case audioInput
     case audioOutput
     case webSearch
+    case bluetoothConnect
+    case bluetoothDisconnect
 
     var logValue: String {
         switch self {
@@ -147,6 +151,10 @@ enum LaunchTargetKind: Hashable {
             return "audio_output"
         case .webSearch:
             return "web_search"
+        case .bluetoothConnect:
+            return "bluetooth_connect"
+        case .bluetoothDisconnect:
+            return "bluetooth_disconnect"
         }
     }
 }
@@ -174,6 +182,7 @@ struct LaunchableApp: Hashable {
     let windowIdentifier: UInt32?
     let audioDeviceIdentifier: AudioDeviceID?
     let audioDeviceUID: String?
+    let bluetoothDeviceAddress: String?
 
     init(
         name: String,
@@ -190,7 +199,8 @@ struct LaunchableApp: Hashable {
         windowFrame: WindowFrame?,
         windowIdentifier: UInt32?,
         audioDeviceIdentifier: AudioDeviceID? = nil,
-        audioDeviceUID: String? = nil
+        audioDeviceUID: String? = nil,
+        bluetoothDeviceAddress: String? = nil
     ) {
         self.name = name
         self.applicationName = applicationName
@@ -207,6 +217,7 @@ struct LaunchableApp: Hashable {
         self.windowIdentifier = windowIdentifier
         self.audioDeviceIdentifier = audioDeviceIdentifier
         self.audioDeviceUID = audioDeviceUID
+        self.bluetoothDeviceAddress = bluetoothDeviceAddress
     }
 
     var subtitle: String {
@@ -232,6 +243,10 @@ struct LaunchableApp: Hashable {
             return "Sound Output\(suffix)"
         case .webSearch:
             return url?.absoluteString ?? "Google Search"
+        case .bluetoothConnect:
+            return "Bluetooth - Not Connected"
+        case .bluetoothDisconnect:
+            return "Bluetooth - Connected"
         }
     }
 
@@ -252,7 +267,7 @@ struct LaunchableApp: Hashable {
             switch targetKind {
             case .application, .window:
                 return true
-            case .bookmark, .audioInput, .audioOutput, .webSearch:
+            case .bookmark, .audioInput, .audioOutput, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
                 return false
             }
         }
@@ -284,7 +299,8 @@ struct LaunchableApp: Hashable {
             windowFrame: windowFrame,
             windowIdentifier: windowIdentifier,
             audioDeviceIdentifier: audioDeviceIdentifier,
-            audioDeviceUID: audioDeviceUID
+            audioDeviceUID: audioDeviceUID,
+            bluetoothDeviceAddress: bluetoothDeviceAddress
         )
     }
 }
@@ -1117,6 +1133,7 @@ private enum AudioDeviceDiscovery {
         let identifier: AudioDeviceID
         let uid: String
         let name: String
+        let transportType: UInt32?
     }
 
     private static let systemObjectID = AudioObjectID(kAudioObjectSystemObject)
@@ -1209,9 +1226,19 @@ private enum AudioDeviceDiscovery {
                 "default_system_output_status": Int(systemOutputStatus)
             ])
             return outputStatus == noErr
-        case .application, .window, .bookmark, .webSearch:
+        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
             return false
         }
+    }
+
+    static func connectedBluetoothDeviceNames() -> [String] {
+        deviceIdentifiers()
+            .compactMap(deviceInfo)
+            .filter { device in
+                device.transportType == kAudioDeviceTransportTypeBluetooth ||
+                    device.transportType == kAudioDeviceTransportTypeBluetoothLE
+            }
+            .map(\.name)
     }
 
     private static func makeCandidate(
@@ -1229,7 +1256,7 @@ private enum AudioDeviceDiscovery {
         case .audioOutput:
             searchAliases = ["sound output", "audio output", "speaker", "headphones", "output"]
             historyPrefix = "audio-output"
-        case .application, .window, .bookmark, .webSearch:
+        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
             searchAliases = []
             historyPrefix = "audio"
         }
@@ -1325,7 +1352,11 @@ private enum AudioDeviceDiscovery {
         return DeviceInfo(
             identifier: deviceID,
             uid: uid,
-            name: name
+            name: name,
+            transportType: uint32Property(
+                kAudioDevicePropertyTransportType,
+                of: AudioObjectID(deviceID)
+            )
         )
     }
 
@@ -1412,6 +1443,29 @@ private enum AudioDeviceDiscovery {
         return string.isEmpty ? nil : string
     }
 
+    private static func uint32Property(
+        _ selector: AudioObjectPropertySelector,
+        of objectID: AudioObjectID
+    ) -> UInt32? {
+        var address = propertyAddress(selector: selector)
+        var value: UInt32 = 0
+        var dataSize = UInt32(MemoryLayout<UInt32>.size)
+        let status = AudioObjectGetPropertyData(
+            objectID,
+            &address,
+            0,
+            nil,
+            &dataSize,
+            &value
+        )
+
+        guard status == noErr else {
+            return nil
+        }
+
+        return value
+    }
+
     private static func propertyAddress(
         selector: AudioObjectPropertySelector,
         scope: AudioObjectPropertyScope = kAudioObjectPropertyScopeGlobal
@@ -1429,7 +1483,7 @@ private enum AudioDeviceDiscovery {
             return 0
         case .audioOutput:
             return 1
-        case .application, .window, .bookmark, .webSearch:
+        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
             return 2
         }
     }
@@ -1474,6 +1528,368 @@ private enum WebSearchCandidateFactory {
             windowFrame: nil,
             windowIdentifier: nil
         )
+    }
+}
+
+private enum BluetoothDeviceDiscovery {
+    private struct BluetoothDeviceInfo {
+        let address: String
+        let name: String
+        let isConnected: Bool
+    }
+
+    private struct ConnectedDeviceSnapshot {
+        let ioregistryAddresses: Set<String>
+        let audioDeviceNames: Set<String>
+
+        func contains(device: IOBluetoothDevice, address: String, name: String) -> Bool {
+            device.isConnected() ||
+                ioregistryAddresses.contains(address) ||
+                audioDeviceNames.contains(normalizedName(name))
+        }
+    }
+
+    struct ConnectionResult {
+        let success: Bool
+        let status: IOReturn
+        let wasConnected: Bool
+        let isConnected: Bool
+
+        var logPayload: [String: Any] {
+            [
+                "success": success,
+                "status": Int(status),
+                "was_connected": wasConnected,
+                "is_connected": isConnected
+            ]
+        }
+    }
+
+    static func loadDevices() -> [LaunchableApp] {
+        bluetoothDevices()
+            .map(makeCandidate)
+            .sorted {
+                if $0.targetKind != $1.targetKind {
+                    return sortRank(for: $0.targetKind) < sortRank(for: $1.targetKind)
+                }
+
+                return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+            }
+    }
+
+    static func setConnection(for app: LaunchableApp) -> ConnectionResult? {
+        guard
+            let address = app.bluetoothDeviceAddress,
+            let device = IOBluetoothDevice(addressString: address)
+        else {
+            AppLog.write("bluetooth_device_switch_failed", [
+                "name": app.name,
+                "target_kind": app.targetKind.logValue,
+                "reason": "missing_bluetooth_device"
+            ])
+            return nil
+        }
+
+        let deviceName = trimmed(device.nameOrAddress) ?? app.name
+        let wasConnected = connectedDeviceSnapshot().contains(
+            device: device,
+            address: address,
+            name: deviceName
+        )
+        let status: IOReturn
+
+        switch app.targetKind {
+        case .bluetoothConnect:
+            status = wasConnected ? kIOReturnSuccess : device.openConnection()
+        case .bluetoothDisconnect:
+            status = wasConnected ? device.closeConnection() : kIOReturnSuccess
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+            return nil
+        }
+
+        let isConnected = waitForConnectionState(
+            device: device,
+            address: address,
+            name: deviceName,
+            connected: app.targetKind == .bluetoothConnect
+        )
+        let success: Bool
+
+        switch app.targetKind {
+        case .bluetoothConnect:
+            success = status == kIOReturnSuccess || isConnected
+        case .bluetoothDisconnect:
+            success = status == kIOReturnSuccess || !isConnected
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+            success = false
+        }
+
+        let result = ConnectionResult(
+            success: success,
+            status: status,
+            wasConnected: wasConnected,
+            isConnected: isConnected
+        )
+
+        AppLog.write("bluetooth_device_switch", [
+            "name": app.name,
+            "target_kind": app.targetKind.logValue,
+            "device_address": address,
+            "result": result.logPayload
+        ])
+
+        return result
+    }
+
+    private static func bluetoothDevices() -> [BluetoothDeviceInfo] {
+        let connectedSnapshot = connectedDeviceSnapshot()
+        let deviceLists = [
+            IOBluetoothDevice.pairedDevices(),
+            IOBluetoothDevice.recentDevices(24)
+        ]
+
+        var devicesByAddress: [String: IOBluetoothDevice] = [:]
+
+        for deviceList in deviceLists {
+            guard let devices = deviceList as? [IOBluetoothDevice] else {
+                continue
+            }
+
+            for device in devices {
+                let address = normalizedAddress(device.addressString)
+                guard !address.isEmpty else {
+                    continue
+                }
+
+                devicesByAddress[address] = devicesByAddress[address] ?? device
+            }
+        }
+
+        return devicesByAddress.values.compactMap { device in
+            let address = normalizedAddress(device.addressString)
+            guard !address.isEmpty else {
+                return nil
+            }
+
+            let name = trimmed(device.nameOrAddress) ?? address
+            return BluetoothDeviceInfo(
+                address: address,
+                name: name,
+                isConnected: connectedSnapshot.contains(
+                    device: device,
+                    address: address,
+                    name: name
+                )
+            )
+        }
+    }
+
+    private static func makeCandidate(from device: BluetoothDeviceInfo) -> LaunchableApp {
+        let targetKind: LaunchTargetKind = device.isConnected ? .bluetoothDisconnect : .bluetoothConnect
+        let stateText = device.isConnected ? "connected disconnect" : "disconnected connect"
+        let identityKey = "bluetooth:\(device.address)"
+        let searchText = [
+            device.name,
+            device.address,
+            "ble",
+            "bluetooth",
+            stateText
+        ].joined(separator: " ")
+
+        return LaunchableApp(
+            name: device.name,
+            applicationName: device.isConnected ? "Connected" : "Not Connected",
+            url: nil,
+            bundleIdentifier: nil,
+            searchText: searchText,
+            identityKey: identityKey,
+            historyKey: identityKey,
+            processIdentifier: nil,
+            isRunning: false,
+            targetKind: targetKind,
+            windowTitle: nil,
+            windowFrame: nil,
+            windowIdentifier: nil,
+            bluetoothDeviceAddress: device.address
+        )
+    }
+
+    private static func sortRank(for kind: LaunchTargetKind) -> Int {
+        switch kind {
+        case .bluetoothDisconnect:
+            return 0
+        case .bluetoothConnect:
+            return 1
+        case .application, .window, .bookmark, .audioInput, .audioOutput, .webSearch:
+            return 2
+        }
+    }
+
+    private static func normalizedAddress(_ address: String?) -> String {
+        (address ?? "")
+            .replacingOccurrences(of: "-", with: ":")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .uppercased()
+    }
+
+    private static func trimmed(_ string: String?) -> String? {
+        guard let string else {
+            return nil
+        }
+
+        let trimmed = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    private static func waitForConnectionState(
+        device: IOBluetoothDevice,
+        address: String,
+        name: String,
+        connected desiredState: Bool
+    ) -> Bool {
+        var latest = connectedDeviceSnapshot().contains(
+            device: device,
+            address: address,
+            name: name
+        )
+        let deadline = Date().addingTimeInterval(2.0)
+
+        while latest != desiredState && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.15)
+            latest = connectedDeviceSnapshot().contains(
+                device: device,
+                address: address,
+                name: name
+            )
+        }
+
+        return latest
+    }
+
+    private static func connectedDeviceSnapshot() -> ConnectedDeviceSnapshot {
+        ConnectedDeviceSnapshot(
+            ioregistryAddresses: connectedBluetoothAddressesFromIORegistry(),
+            audioDeviceNames: Set(AudioDeviceDiscovery.connectedBluetoothDeviceNames().map(normalizedName))
+        )
+    }
+
+    private static func connectedBluetoothAddressesFromIORegistry() -> Set<String> {
+        var addresses = Set<String>()
+        let classes = [
+            "AppleDeviceManagementHIDEventService",
+            "IOBluetoothDevice"
+        ]
+
+        for className in classes {
+            var iterator: io_iterator_t = 0
+            let status = IOServiceGetMatchingServices(
+                kIOMainPortDefault,
+                IOServiceMatching(className),
+                &iterator
+            )
+
+            guard status == KERN_SUCCESS else {
+                continue
+            }
+
+            while true {
+                let service = IOIteratorNext(iterator)
+                if service == 0 {
+                    break
+                }
+
+                defer {
+                    IOObjectRelease(service)
+                }
+
+                guard let properties = registryProperties(for: service) else {
+                    continue
+                }
+
+                if className == "IOBluetoothDevice" {
+                    guard connectionHandle(from: properties) != 4095 else {
+                        continue
+                    }
+                } else if (properties["BluetoothDevice"] as? Bool) != true {
+                    continue
+                }
+
+                if let address = bluetoothAddress(from: properties) {
+                    addresses.insert(address)
+                }
+            }
+
+            IOObjectRelease(iterator)
+        }
+
+        return addresses
+    }
+
+    private static func registryProperties(for service: io_object_t) -> [String: Any]? {
+        var rawProperties: Unmanaged<CFMutableDictionary>?
+        let status = IORegistryEntryCreateCFProperties(
+            service,
+            &rawProperties,
+            kCFAllocatorDefault,
+            0
+        )
+
+        guard
+            status == KERN_SUCCESS,
+            let properties = rawProperties?.takeRetainedValue() as? [String: Any]
+        else {
+            return nil
+        }
+
+        return properties
+    }
+
+    private static func connectionHandle(from properties: [String: Any]) -> Int? {
+        if let value = properties["ConnectionHandle"] as? Int {
+            return value
+        }
+
+        if let value = properties["ConnectionHandle"] as? NSNumber {
+            return value.intValue
+        }
+
+        return nil
+    }
+
+    private static func bluetoothAddress(from properties: [String: Any]) -> String? {
+        let keys = [
+            "DeviceAddress",
+            "BD_ADDR",
+            "BTAddress"
+        ]
+
+        for key in keys {
+            guard let value = properties[key] else {
+                continue
+            }
+
+            if let string = value as? String {
+                let address = normalizedAddress(string)
+                if !address.isEmpty {
+                    return address
+                }
+            } else if let data = value as? Data {
+                let address = normalizedAddress(
+                    data.map { String(format: "%02X", $0) }.joined(separator: ":")
+                )
+                if !address.isEmpty {
+                    return address
+                }
+            }
+        }
+
+        return nil
+    }
+
+    private static func normalizedName(_ name: String) -> String {
+        name.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
     }
 }
 
@@ -1659,6 +2075,8 @@ enum WindowActivator {
         case .audioInput, .audioOutput:
             return false
         case .webSearch:
+            return false
+        case .bluetoothConnect, .bluetoothDisconnect:
             return false
         }
     }
@@ -3408,7 +3826,9 @@ final class AppCellView: NSTableCellView {
     }
 
     func configure(with app: LaunchableApp) {
-        if app.targetKind == .webSearch {
+        if app.targetKind == .bluetoothConnect || app.targetKind == .bluetoothDisconnect {
+            appIconView.image = NSImage(systemSymbolName: "dot.radiowaves.left.and.right", accessibilityDescription: nil)
+        } else if app.targetKind == .webSearch {
             appIconView.image = NSImage(systemSymbolName: "magnifyingglass", accessibilityDescription: nil)
         } else if let audioIcon = icon(forAudioTargetKind: app.targetKind) {
             appIconView.image = audioIcon
@@ -3435,7 +3855,7 @@ final class AppCellView: NSTableCellView {
             return NSImage(systemSymbolName: "mic.fill", accessibilityDescription: nil)
         case .audioOutput:
             return NSImage(systemSymbolName: "speaker.wave.2.fill", accessibilityDescription: nil)
-        case .application, .window, .bookmark, .webSearch:
+        case .application, .window, .bookmark, .webSearch, .bluetoothConnect, .bluetoothDisconnect:
             return nil
         }
     }
@@ -3821,6 +4241,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var cachedInstalledApps: [LaunchableApp] = []
     private var cachedBookmarks: [LaunchableApp] = []
     private var cachedAudioDevices: [LaunchableApp] = []
+    private var cachedBluetoothDevices: [LaunchableApp] = []
     private var cachedApps: [LaunchableApp] = []
     private var lastScanDate = Date.distantPast
     private var previousFrontmostProcessIdentifier: pid_t?
@@ -3840,6 +4261,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "cached_installed_apps": cachedInstalledApps.count,
             "cached_bookmarks": cachedBookmarks.count,
             "cached_audio_devices": cachedAudioDevices.count,
+            "cached_bluetooth_devices": cachedBluetoothDevices.count,
             "cached_apps": cachedApps.count
         ])
     }
@@ -4244,6 +4666,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         cachedAudioDevices = AudioDeviceDiscovery.loadDevices()
+        cachedBluetoothDevices = BluetoothDeviceDiscovery.loadDevices()
         rebuildCandidateCache()
         AppLog.write("refresh_applications", [
             "force": force,
@@ -4251,6 +4674,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "installed_candidates": cachedInstalledApps.count,
             "bookmark_candidates": cachedBookmarks.count,
             "audio_device_candidates": cachedAudioDevices.count,
+            "bluetooth_device_candidates": cachedBluetoothDevices.count,
             "all_candidates": cachedApps.count
         ])
     }
@@ -4258,7 +4682,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func rebuildCandidateCache() {
         cachedApps = AppDiscovery.includeRunningApplications(in: cachedInstalledApps) +
             cachedBookmarks +
-            cachedAudioDevices
+            cachedAudioDevices +
+            cachedBluetoothDevices
     }
 
     private func launch(_ app: LaunchableApp) {
@@ -4274,11 +4699,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             "window_identifier": logWindowIdentifier(app.windowIdentifier),
             "window_frame": logFrame(app.windowFrame),
             "audio_device_id": logAudioDeviceIdentifier(app.audioDeviceIdentifier),
-            "audio_device_uid": app.audioDeviceUID ?? "nil"
+            "audio_device_uid": app.audioDeviceUID ?? "nil",
+            "bluetooth_device_address": app.bluetoothDeviceAddress ?? "nil"
         ])
 
         if app.targetKind == .audioInput || app.targetKind == .audioOutput {
             launchAudioDevice(app)
+            return
+        }
+
+        if app.targetKind == .bluetoothConnect || app.targetKind == .bluetoothDisconnect {
+            launchBluetoothDevice(app)
             return
         }
 
@@ -4406,6 +4837,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 "target_kind": app.targetKind.logValue,
                 "reason": "failed_to_open_web_search_url"
             ])
+        }
+    }
+
+    private func launchBluetoothDevice(_ app: LaunchableApp) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            let result = BluetoothDeviceDiscovery.setConnection(for: app)
+
+            DispatchQueue.main.async {
+                guard let self else {
+                    return
+                }
+
+                guard result?.success == true else {
+                    NSSound.beep()
+                    AppLog.write("launch_failed", [
+                        "name": app.name,
+                        "target_kind": app.targetKind.logValue,
+                        "bluetooth_device_address": app.bluetoothDeviceAddress ?? "nil",
+                        "reason": "failed_to_switch_bluetooth_device",
+                        "result": result?.logPayload ?? [:]
+                    ])
+                    return
+                }
+
+                self.launchHistoryStore.recordLaunch(of: app)
+                self.cachedBluetoothDevices = BluetoothDeviceDiscovery.loadDevices()
+                self.rebuildCandidateCache()
+                AppLog.write("launch_completed", [
+                    "name": app.name,
+                    "target_kind": app.targetKind.logValue,
+                    "bluetooth_device_address": app.bluetoothDeviceAddress ?? "nil",
+                    "result": result?.logPayload ?? [:]
+                ])
+            }
         }
     }
 

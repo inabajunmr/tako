@@ -69,6 +69,8 @@ Google Chrome bookmarks are scanned from local Chrome profiles and are included 
 you start typing when that source is enabled. Selecting a bookmark opens it with the default browser.
 Sound input and output devices are included as candidates when you type terms such as `sound input`
 or `sound output`. Selecting one switches the macOS default input or output device.
+Paired or recently used Bluetooth devices are included as candidates when you type terms such as
+`ble` or `bluetooth`. Selecting one connects or disconnects that device.
 When the search field is not empty, the last candidate searches Google for the entered text.
 On startup, Tendon checks its own Screen Recording and Accessibility status, then only
 requests the missing permissions.

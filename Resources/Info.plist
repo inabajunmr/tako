@@ -22,6 +22,8 @@
 	<true/>
 	<key>NSHighResolutionCapable</key>
 	<true/>
+	<key>NSBluetoothAlwaysUsageDescription</key>
+	<string>Tendon uses Bluetooth access to connect and disconnect paired devices from the launcher.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Tendon uses window titles to let you choose a specific app window.</string>
 </dict>
