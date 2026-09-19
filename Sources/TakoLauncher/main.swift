@@ -3445,10 +3445,6 @@ enum WindowPermissionManager {
                 }
             } catch {
                 await MainActor.run {
-                    if !isScreenRecordingGranted {
-                        openScreenRecordingSettings()
-                    }
-
                     if let onGranted {
                         waitUntil({ isScreenRecordingGranted }, then: onGranted)
                     }
@@ -3473,18 +3469,6 @@ enum WindowPermissionManager {
             permissionPollTimer = nil
             onGranted()
         }
-    }
-
-    private static func openScreenRecordingSettings() {
-        openSettingsPane("x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture")
-    }
-
-    private static func openSettingsPane(_ urlString: String) {
-        guard let url = URL(string: urlString) else {
-            return
-        }
-
-        NSWorkspace.shared.open(url)
     }
 
     private static func resetPrivacyPermissionsIfNeeded(
